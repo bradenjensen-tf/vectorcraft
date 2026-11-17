@@ -4591,6 +4591,69 @@ fn scaled_point_type_and_a_last_empty_paragraph_come_back() {
     );
 }
 
+/// Rotated area type comes back with its frame rotated, the type readable. The rotation is
+/// encoded in the frame's path coordinates, not as a separate matrix.
+#[test]
+fn rotated_area_type_comes_back() {
+    use vectorcraft_doc::{CharStyle, TextKind, TextObject};
+    let mut doc = Document::new(300.0, 200.0);
+    let layer = doc.layers[0].id;
+    let st = CharStyle { size: 12.0, ..style(12.0, Color::BLACK) };
+    let frame = vectorcraft_geom::shapes::rectangle(Rect::new(0.0, 0.0, 80.0, 40.0));
+    let mut rotated = TextObject::point(vectorcraft_geom::Point::ZERO, "Rotated area type", st.clone());
+    rotated.kind = TextKind::Area { frame: frame.clone() };
+    rotated.xf = Affine::translate((50.0, 50.0)) * Affine::rotate(std::f64::consts::FRAC_PI_4);
+    let rotated = text_node(&mut doc, rotated);
+    doc.insert(Some(layer), usize::MAX, rotated).unwrap();
+    let out = export_ai_editing(&doc, &opts()).unwrap();
+    assert!(out.warnings.is_empty(), "rotated area type should not warn: {:?}", out.warnings);
+    let prog = program(&doc);
+    assert!(prog.contains("%AI11_BeginTextDocument"), "rotated area type should be in text document");
+    let back = read_back(&doc);
+    let texts: Vec<&TextObject> = back.layers[0]
+        .children()
+        .unwrap()
+        .iter()
+        .filter_map(|n| if let NodeKind::Text(t) = &n.kind { Some(t.as_ref()) } else { None })
+        .collect();
+    assert_eq!(texts.len(), 1, "one text object came back");
+    assert!(matches!(texts[0].kind, TextKind::Area { .. }), "came back as area type");
+    assert!(texts[0].plain_text().starts_with("Rotated area type"), "text preserved: {:?}", texts[0].plain_text());
+    if let TextKind::Area { frame } = &texts[0].kind {
+        let bounds = frame.bounds().unwrap();
+        assert!(bounds.width() > 20.0 && bounds.height() > 20.0, "frame has extent: {bounds:?}");
+    }
+}
+
+/// Rotated type on a path comes back with its path rotated.
+#[test]
+fn rotated_type_on_path_comes_back() {
+    use vectorcraft_doc::{CharStyle, TextKind, TextObject};
+    let mut doc = Document::new(300.0, 200.0);
+    let layer = doc.layers[0].id;
+    let st = CharStyle { size: 12.0, ..style(12.0, Color::BLACK) };
+    let path = vectorcraft_geom::shapes::ellipse(Rect::new(0.0, 0.0, 100.0, 50.0));
+    let mut rotated = TextObject::point(vectorcraft_geom::Point::ZERO, "On path", st);
+    rotated.kind = TextKind::OnPath { path, start: 0.0, end: None };
+    rotated.xf = Affine::translate((150.0, 100.0)) * Affine::rotate(-0.3);
+    let rotated = text_node(&mut doc, rotated);
+    doc.insert(Some(layer), usize::MAX, rotated).unwrap();
+    let out = export_ai_editing(&doc, &opts()).unwrap();
+    assert!(out.warnings.is_empty(), "rotated type on path should not warn: {:?}", out.warnings);
+    let prog = program(&doc);
+    assert!(prog.contains("%AI11_BeginTextDocument"), "rotated type on path should be in text document");
+    let back = read_back(&doc);
+    let texts: Vec<&TextObject> = back.layers[0]
+        .children()
+        .unwrap()
+        .iter()
+        .filter_map(|n| if let NodeKind::Text(t) = &n.kind { Some(t.as_ref()) } else { None })
+        .collect();
+    assert_eq!(texts.len(), 1, "one text object came back");
+    assert!(matches!(texts[0].kind, TextKind::OnPath { .. }), "came back as type on path");
+    assert!(texts[0].plain_text().starts_with("On path"), "text preserved: {:?}", texts[0].plain_text());
+}
+
 /// A threaded story whose frames each hold their slice of it, a paragraph split between them,
 /// comes back as one story in its first frame with each paragraph's attributes once.
 #[test]

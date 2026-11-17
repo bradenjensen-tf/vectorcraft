@@ -195,10 +195,10 @@ fn solid(p: &Paint) -> Option<Option<Color>> {
     }
 }
 
-/// Can the text document hold type `t` of object `n` as it is: point type that isn't mirrored, or
-/// area type or type on a path that is only moved ([`shape`]); characters other than inline graphics
-/// and ruby; solid fills and strokes; no fills, strokes, effects or opacity mask of the object's
-/// own; some text. Area type with wrap shapes only when `wrap_held` ([`wraps_held`]).
+/// Can the text document hold type `t` of object `n` as it is: point type that isn't mirrored;
+/// area type or type on a path that isn't mirrored ([`shape`]); characters other than inline
+/// graphics and ruby; solid fills and strokes; no fills, strokes, effects or opacity mask of the
+/// object's own; some text. Area type with wrap shapes only when `wrap_held` ([`wraps_held`]).
 pub(in crate::ai_editing) fn holds(n: &Node, t: &TextObject, wrap_held: bool) -> bool {
     let xf = t.xf.as_coeffs();
     let shape_ok = match &t.kind {
@@ -302,16 +302,17 @@ fn joined(texts: &[&TextObject]) -> Option<(TextObject, bool)> {
     Some((whole, differs))
 }
 
-/// The frame of area type or the path of type on a path, in document coordinates: when the matrix
-/// of type `t` only moves it and scales it by one factor (as a large canvas does), its frame or
-/// path through that matrix ([`story_scale`] puts the factor into its lengths). `None` for point
-/// type and for type that is turned, mirrored, skewed or scaled by two factors.
+/// The frame of area type or the path of type on a path, in document coordinates: the frame or
+/// path through the type's matrix ([`story_scale`] puts its scale into its lengths). `None` for
+/// point type, for mirrored type (negative determinant), and for type whose coefficients aren't
+/// finite.
 fn shape(t: &TextObject) -> Option<PathData> {
     let [a, b, c, d, e, f] = t.xf.as_coeffs();
-    let even = a > 0.0 && (a - d).abs() <= a * 1e-9 && b == 0.0 && c == 0.0 && e.is_finite() && f.is_finite();
+    let det = a * d - b * c;
+    let ok = det > 1e-12 && [a, b, c, d, e, f].iter().all(|v| v.is_finite());
     match &t.kind {
-        TextKind::Area { frame } if even => Some(frame.transformed(t.xf)),
-        TextKind::OnPath { path, .. } if even => Some(path.transformed(t.xf)),
+        TextKind::Area { frame } if ok => Some(frame.transformed(t.xf)),
+        TextKind::OnPath { path, .. } if ok => Some(path.transformed(t.xf)),
         _ => None,
     }
 }
