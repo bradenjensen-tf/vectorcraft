@@ -200,6 +200,18 @@ fn pdfx_1a_and_x3_files_have_no_transparency() {
     assert!(t.contains("/ca 0.5") || t.contains("/S/Transparency"), "PDF/X-4 keeps transparency");
 }
 
+/// PDF/X-1a and PDF/X-3 files have no CMYK page groups that could write soft masks: `cmyk_page_group`
+/// is off when `pdf13` is true.
+#[test]
+fn pdfx_1a_and_x3_files_have_no_cmyk_page_groups() {
+    // A CMYK document that would trigger `cmyk_page_group` in a regular PDF 1.4+ export.
+    let d = doc(&[Color::cmyk(1.0, 0.0, 0.0, 0.0), Color::cmyk(0.0, 1.0, 0.0, 0.0)]);
+    for standard in [Standard::PdfX1a, Standard::PdfX3] {
+        let t = text(&export(&d, &opts(standard, |_| {})).unwrap());
+        assert!(!t.contains("/S/Transparency") && !t.contains("/SMask"), "{standard:?}: no soft masks in PDF/X-1a/X-3");
+    }
+}
+
 #[test]
 fn pdfx_settings_rules() {
     for standard in X {
