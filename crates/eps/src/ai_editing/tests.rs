@@ -4610,12 +4610,8 @@ fn rotated_area_type_comes_back() {
     let prog = program(&doc);
     assert!(prog.contains("%AI11_BeginTextDocument"), "rotated area type should be in text document");
     let back = read_back(&doc);
-    let texts: Vec<&TextObject> = back.layers[0]
-        .children()
-        .unwrap()
-        .iter()
-        .filter_map(|n| if let NodeKind::Text(t) = &n.kind { Some(t.as_ref()) } else { None })
-        .collect();
+    let texts: Vec<&TextObject> =
+        back.layers[0].children().unwrap().iter().filter_map(|n| if let NodeKind::Text(t) = &n.kind { Some(t.as_ref()) } else { None }).collect();
     assert_eq!(texts.len(), 1, "one text object came back");
     assert!(matches!(texts[0].kind, TextKind::Area { .. }), "came back as area type");
     assert!(texts[0].plain_text().starts_with("Rotated area type"), "text preserved: {:?}", texts[0].plain_text());
@@ -4643,12 +4639,8 @@ fn rotated_type_on_path_comes_back() {
     let prog = program(&doc);
     assert!(prog.contains("%AI11_BeginTextDocument"), "rotated type on path should be in text document");
     let back = read_back(&doc);
-    let texts: Vec<&TextObject> = back.layers[0]
-        .children()
-        .unwrap()
-        .iter()
-        .filter_map(|n| if let NodeKind::Text(t) = &n.kind { Some(t.as_ref()) } else { None })
-        .collect();
+    let texts: Vec<&TextObject> =
+        back.layers[0].children().unwrap().iter().filter_map(|n| if let NodeKind::Text(t) = &n.kind { Some(t.as_ref()) } else { None }).collect();
     assert_eq!(texts.len(), 1, "one text object came back");
     assert!(matches!(texts[0].kind, TextKind::OnPath { .. }), "came back as type on path");
     assert!(texts[0].plain_text().starts_with("On path"), "text preserved: {:?}", texts[0].plain_text());
