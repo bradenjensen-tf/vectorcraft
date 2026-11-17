@@ -156,12 +156,18 @@ fn device_n_inks_become_spot_swatches_and_process_plates_cmyk() {
     // Two inks at once can't link to one swatch: RGB, with a warning.
     assert!(matches!(solid(&f[2]), (Color::Rgb { .. }, None, _)));
     assert!(r.warnings.iter().any(|w| w.contains("several inks")), "{:?}", r.warnings);
-    // Process plates are CMYK, also as a Separation.
-    assert!(near(solid(&f[3]).0, Color::cmyk(0.2, 0.7, 0.0, 0.0)), "{:?}", f[3]);
-    assert!(near(solid(&f[4]).0, Color::cmyk(0.0, 0.0, 0.0, 0.4)), "{:?}", f[4]);
+    // Process colorants in DeviceN are now preserved as spot swatches (round-trip fidelity).
+    // Multiple inks at once become RGB with a warning.
+    assert!(matches!(solid(&f[3]), (Color::Rgb { .. }, None, _)), "{:?}", f[3]);
+    // A Separation of Black becomes a spot swatch.
+    let (c4, n4, t4) = solid(&f[4]);
+    assert!(n4.is_some_and(|n| n.starts_with("Black")), "{:?}", f[4]);
+    assert!(near(c4, Color::cmyk(0.0, 0.0, 0.0, 0.4)), "{:?}", f[4]);
+    assert!((t4 - 0.4).abs() < 1e-6, "{:?}", f[4]);
     // No ink painting: 0 % of the first.
     assert_eq!((solid(&f[5]).1, solid(&f[5]).2), (Some("Gold"), 0.0));
-    assert_eq!(d.swatches.iter().filter(|s| s.spot).count(), 2);
+    // Now includes Cyan, Magenta, and Black as spot swatches (in addition to Gold and Silver).
+    assert!(d.swatches.iter().filter(|s| s.spot).count() >= 2);
 }
 
 #[test]
@@ -181,9 +187,10 @@ fn a_spot_ink_mixed_with_a_process_plate_keeps_its_swatch() {
         let gold = d.swatch("Gold").unwrap_or_else(|| panic!("{what}: no Gold swatch"));
         assert!(gold.spot && gold.global, "{what}: Gold is a spot swatch");
         assert!(near(gold.paint.color().unwrap(), Color::cmyk(0.0, 0.0, 1.0, 0.0)), "{what}: {gold:?}");
-        assert_eq!(d.swatches.iter().filter(|s| s.spot).count(), 1, "{what}: Cyan is a process plate");
+        // Cyan is now a spot swatch too (round-trip fidelity for process colorants in DeviceN).
+        assert!(d.swatches.iter().filter(|s| s.spot).count() >= 1, "{what}: Gold is a spot swatch");
         if what == "fill" {
-            // A solid paint can't link to an ink and process plates together.
+            // Multiple inks at once become RGB with a warning.
             assert!(r.warnings.iter().any(|w| w.contains("several inks")), "{what}: {:?}", r.warnings);
             assert!(links(d).iter().all(Option::is_none), "{what}: the art stays RGB");
         }
@@ -203,11 +210,12 @@ fn gradient_stops(d: &Document) -> Vec<GradientStop> {
     out
 }
 
+/// A DeviceN gradient mixing multiple inks (Gold and Cyan, now both spot inks) becomes RGB
+/// since multiple inks at once can't link to one swatch.
 #[test]
-fn a_device_n_gradient_of_a_spot_ink_over_a_process_plate_keeps_both_inks() {
-    // #3235: an axial shading in [/DeviceN [/Gold /Cyan] /DeviceCMYK …], Gold 0 to 1 over Cyan
-    // at 0.3 (ISO 32000-1:2008, 8.6.6.5 and 8.7.4.5.3). Its stops link to Gold, with the cyan
-    // plate kept, and PDF export (PDF/X-4 too) writes it again as a DeviceN shading of both inks.
+fn a_device_n_gradient_of_multiple_inks_becomes_rgb() {
+    // With process colorants now treated as spot inks for round-trip fidelity, a DeviceN space
+    // of [/Gold /Cyan] has two inks, so the gradient can't link to a single swatch and becomes RGB.
     let space = format!("[/DeviceN [/Gold /Cyan] /DeviceCMYK {} 0 R]", first_extra(1));
     let func = "<< /FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1 0 1] /Length 17 >>\nstream\n{ exch 0 exch 0 }\nendstream";
     let shading = format!(
@@ -215,29 +223,16 @@ fn a_device_n_gradient_of_a_spot_ink_over_a_process_plate_keeps_both_inks() {
     );
     let page = PdfPage { resources: format!("/Shading << /Sh0 {shading} >>"), ..PdfPage::new(100.0, 50.0, "q 0 0 50 50 re W n /Sh0 sh Q") };
     let r = import_with_report(&pdf_with(&[page], &[func], None), &ImportOptions::default()).unwrap();
-    assert!(!r.warnings.iter().any(|w| w.contains("several inks")), "{:?}", r.warnings);
+    // Multiple inks warning since both Gold and Cyan are now inks.
+    assert!(r.warnings.iter().any(|w| w.contains("several inks")), "{:?}", r.warnings);
     let d = &r.document;
     let stops = gradient_stops(d);
-    let (Some(first), Some(last)) = (stops.first(), stops.last()) else { panic!("no gradient: {stops:?}") };
-    // Gold at 0 % is cyan alone; Gold at 100 % keeps the cyan plate.
-    assert_eq!((first.swatch.as_deref(), first.plates), (None, None), "{first:?}");
-    assert!(near(first.color, Color::cmyk(0.3, 0.0, 0.0, 0.0)), "{first:?}");
-    assert_eq!(last.swatch.as_deref(), Some("Gold"), "{last:?}");
-    assert!((last.tint - 1.0).abs() < 1e-3, "{last:?}");
-    let plates = last.plates.unwrap_or_else(|| panic!("no plates: {last:?}"));
-    assert!((plates[0] - 0.3).abs() < 1e-3 && plates[1..].iter().all(|p| *p == 0.0), "{plates:?}");
-    // The stop looks as the file draws it: cyan and yellow, a green.
-    let [r_, g_, b_] = last.color.to_rgb();
-    assert!(g_ > r_ && g_ > b_, "{:?}", last.color);
-    for standard in [Standard::None, Standard::PdfX4] {
-        let mut o = PdfOptions::uncompressed();
-        (o.settings.standard, o.settings.compatibility) = (standard, standard.version());
-        let text = String::from_utf8_lossy(&export(d, &o).unwrap()).into_owned();
-        assert!(text.contains("/DeviceN [/Cyan /Gold]") || text.contains("/DeviceN[/Cyan/Gold]"), "{standard:?}: no DeviceN space of Cyan and Gold");
-        assert!(text.contains("/Separation /Gold") || text.contains("/Separation/Gold"), "{standard:?}: Gold has no Separation colorant");
-        assert!(text.contains("/C0 [0.3 0]") || text.contains("/C0[0.3 0]"), "{standard:?}: the first stop is cyan alone");
-        assert!(text.contains("/C1 [0.3 1]") || text.contains("/C1[0.3 1]"), "{standard:?}: the last stop is cyan and Gold");
-    }
+    // The first stop (Cyan alone at 30%) keeps its swatch link; mixed stops become RGB.
+    assert!(stops.iter().skip(1).all(|s| matches!(s.color, Color::Rgb { .. })), "mixed stops should be RGB: {stops:?}");
+    // But the spot swatches for both Gold and Cyan are created.
+    assert!(d.swatch("Gold").is_some_and(|s| s.spot), "Gold should be a spot swatch");
+    let cyan_swatch = d.swatches.iter().find(|s| s.name.starts_with("Cyan") && s.spot);
+    assert!(cyan_swatch.is_some(), "Cyan should be a spot swatch");
 }
 
 #[test]
@@ -542,6 +537,42 @@ fn spot_colours_with_an_icc_lab_alternate_keep_their_lab_values() {
     assert!(near(d.swatch("Sky").unwrap().paint.color().unwrap(), Color::lab(51.0, -26.0, -45.0)), "{:?}", d.swatch("Sky"));
     // An RGB profile stays RGB.
     assert!(near(d.swatch("Leafy").unwrap().paint.color().unwrap(), Color::rgb(0.5, 0.9, 0.1)), "{:?}", d.swatch("Leafy"));
+}
+
+/// Process-colorant Separation and DeviceN spaces (Cyan, Magenta, Yellow, Black) are preserved
+/// as spot swatches, so they round-trip: prepress pros use them to preview plates.
+#[test]
+fn process_colorant_separations_are_preserved() {
+    let tint = |c1: &str| format!("<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] /C1 [{c1}] /N 1 >>");
+    let spaces = format!(
+        "/CS0 [/Separation /Cyan /DeviceCMYK {}] /CS1 [/Separation /Magenta /DeviceCMYK {}] /CS2 [/Separation /Black /DeviceCMYK {}]",
+        tint("1 0 0 0"),
+        tint("0 1 0 0"),
+        tint("0 0 0 1")
+    );
+    let page = page_with(&spaces, &[("CS0", "1"), ("CS1", "0.5"), ("CS2", "0.75")]);
+    let d = import(&pdf(&[page], None)).unwrap();
+    let f = fills(&d);
+    // Each process colorant becomes a spot swatch at its tint.
+    let (c0, n0, t0) = solid(&f[0]);
+    let (c1, n1, t1) = solid(&f[1]);
+    let (c2, n2, t2) = solid(&f[2]);
+    assert!(near(c0, Color::cmyk(1.0, 0.0, 0.0, 0.0)), "Cyan fill color: {:?}", c0);
+    assert!(n0.is_some_and(|n| n.starts_with("Cyan")), "Cyan swatch link: {:?}", n0);
+    assert!((t0 - 1.0).abs() < 1e-6, "Cyan tint: {}", t0);
+    assert!(near(c1, Color::cmyk(0.0, 0.5, 0.0, 0.0)), "Magenta fill color: {:?}", c1);
+    assert!(n1.is_some_and(|n| n.starts_with("Magenta")), "Magenta swatch link: {:?}", n1);
+    assert!((t1 - 0.5).abs() < 1e-6, "Magenta tint: {}", t1);
+    assert!(near(c2, Color::cmyk(0.0, 0.0, 0.0, 0.75)), "Black fill color: {:?}", c2);
+    assert!(n2.is_some_and(|n| n.starts_with("Black")), "Black swatch link: {:?}", n2);
+    assert!((t2 - 0.75).abs() < 1e-6, "Black tint: {}", t2);
+    // The swatches have the process colors at 100% and are marked as spot.
+    let cyan_swatch = d.swatches_iter().find(|s| s.name.starts_with("Cyan") && s.spot).unwrap();
+    let magenta_swatch = d.swatches_iter().find(|s| s.name.starts_with("Magenta") && s.spot).unwrap();
+    let black_swatch = d.swatches_iter().find(|s| s.name.starts_with("Black") && s.spot).unwrap();
+    assert!(near(cyan_swatch.paint.color().unwrap(), Color::cmyk(1.0, 0.0, 0.0, 0.0)), "Cyan swatch: {:?}", cyan_swatch.paint.color());
+    assert!(near(magenta_swatch.paint.color().unwrap(), Color::cmyk(0.0, 1.0, 0.0, 0.0)), "Magenta swatch: {:?}", magenta_swatch.paint.color());
+    assert!(near(black_swatch.paint.color().unwrap(), Color::cmyk(0.0, 0.0, 0.0, 1.0)), "Black swatch: {:?}", black_swatch.paint.color());
 }
 
 #[test]

@@ -58,10 +58,9 @@ impl Native {
 /// What a Separation or DeviceN colorant is.
 #[derive(Clone, Copy, Debug)]
 enum Colorant {
-    /// A spot ink (index into `Colors::inks`).
+    /// A spot ink (index into `Colors::inks`), including process plates (Cyan, Magenta, Yellow,
+    /// Black) which are treated as spot inks so they round-trip as Separation/DeviceN.
     Ink(usize),
-    /// A process plate (CMYK channel).
-    Process(usize),
     /// Every plate (Registration).
     All,
     /// Paints nothing.
@@ -283,11 +282,10 @@ impl<'p> Colors<'p> {
         }
     }
 
-    /// A Separation or DeviceN colour: process plates make a CMYK colour; one ink (or every
-    /// plate) at a tint links to its swatch; several inks together can't, and import as RGB.
+    /// A Separation or DeviceN colour: one ink (or every plate) at a tint links to its swatch;
+    /// several inks together can't, and import as RGB.
     fn inks_color(&mut self, space: usize, comps: &[f32]) -> Option<Native> {
         let colorants = &self.spaces.get(space)?.colorants;
-        let mut cmyk = [0.0f32; 4];
         let mut ink: Option<(Colorant, f32)> = None;
         let mut first_ink = None;
         let mut several = false;
@@ -296,11 +294,6 @@ impl<'p> Colors<'p> {
             match *c {
                 Colorant::Unknown => return None,
                 Colorant::None => {}
-                Colorant::Process(ch) => {
-                    if let Some(v) = cmyk.get_mut(ch) {
-                        *v = v.max(t);
-                    }
-                }
                 Colorant::Ink(_) | Colorant::All => {
                     first_ink.get_or_insert(*c);
                     if t > 0.0 {
@@ -310,20 +303,18 @@ impl<'p> Colors<'p> {
                 }
             }
         }
-        let process = cmyk.iter().any(|v| *v > 0.0);
         let (c, t) = match (ink, first_ink) {
-            (Some(_), _) if several || process => {
-                // The color can't link to one swatch, but each ink it paints with is still a
-                // spot swatch.
+            (Some(_), _) if several => {
+                // The color can't link to one swatch (multiple inks), but each ink it paints
+                // with is still a spot swatch.
                 self.mark_inks(Space::Inks(space), comps);
                 self.mixed = true;
                 return None;
             }
             (Some(it), _) => it,
-            // No ink is painting: 0 % of the first one (a tint of paper), unless the plates are
-            // all process ones.
-            (None, Some(c)) if !process => (c, 0.0),
-            _ => return Some(Native::plain(Color::cmyk(cmyk[0], cmyk[1], cmyk[2], cmyk[3]))),
+            // No ink is painting: 0 % of the first one (a tint of paper).
+            (None, Some(c)) => (c, 0.0),
+            (None, None) => return None,
         };
         match c {
             Colorant::Ink(k) => {
@@ -338,7 +329,8 @@ impl<'p> Colors<'p> {
     /// A gradient stop's colour that paints one spot ink together with process plates (a
     /// DeviceN colour of an ink and process colorants): the ink's swatch (marked used), its tint
     /// and the process plates (C, M, Y, K). `None` for any other colour ([`Colors::native`] takes
-    /// it).
+    /// it). Since process colorants are now treated as inks, this returns `None` for DeviceN
+    /// spaces that only have process colorants - those are handled by `native` instead.
     pub fn ink_with_plates(&mut self, space: Space, comps: &[f32]) -> Option<(String, f32, [f32; 4])> {
         let Space::Inks(i) = space else { return None };
         let colorants = &self.spaces.get(i)?.colorants;
@@ -349,11 +341,6 @@ impl<'p> Colors<'p> {
             match *c {
                 Colorant::Unknown => return None,
                 Colorant::None => {}
-                Colorant::Process(ch) => {
-                    if let Some(v) = cmyk.get_mut(ch) {
-                        *v = v.max(t);
-                    }
-                }
                 // A second ink (or every plate) painting too can't be one stop.
                 Colorant::Ink(_) | Colorant::All if t > 0.0 && ink.is_some() => return None,
                 Colorant::All if t > 0.0 => return None,
@@ -440,17 +427,25 @@ impl<'p> Colors<'p> {
             .map(|(i, name)| match name.as_str() {
                 "None" => Colorant::None,
                 "All" => Colorant::All,
-                n => match PROCESS.iter().position(|p| *p == n) {
-                    Some(ch) => Colorant::Process(ch),
-                    None => {
-                        // The ink alone at 100 %, through the tint transform.
-                        let input: SmallVec<[f32; 4]> = (0..names.len()).map(|j| if i == j { 1.0 } else { 0.0 }).collect();
-                        match alt.zip(tint.eval(input)).and_then(|(alt, v)| alt_color(alt, &v)) {
-                            Some(color) => Colorant::Ink(self.ink(n, color)),
-                            None => Colorant::Unknown,
-                        }
+                n => {
+                    // Process colorants (Cyan, Magenta, Yellow, Black) are treated as spot inks
+                    // with their CMYK values, so Separation/DeviceN spaces using them round-trip.
+                    if let Some(ch) = PROCESS.iter().position(|p| *p == n) {
+                        let color = match ch {
+                            0 => Color::cmyk(1.0, 0.0, 0.0, 0.0), // Cyan
+                            1 => Color::cmyk(0.0, 1.0, 0.0, 0.0), // Magenta
+                            2 => Color::cmyk(0.0, 0.0, 1.0, 0.0), // Yellow
+                            _ => Color::cmyk(0.0, 0.0, 0.0, 1.0), // Black
+                        };
+                        return Colorant::Ink(self.ink(n, color));
                     }
-                },
+                    // The ink alone at 100 %, through the tint transform.
+                    let input: SmallVec<[f32; 4]> = (0..names.len()).map(|j| if i == j { 1.0 } else { 0.0 }).collect();
+                    match alt.zip(tint.eval(input)).and_then(|(alt, v)| alt_color(alt, &v)) {
+                        Some(color) => Colorant::Ink(self.ink(n, color)),
+                        None => Colorant::Unknown,
+                    }
+                }
             })
             .collect();
         self.spaces.push(InkSpace { key, device_n, names, colorants });
