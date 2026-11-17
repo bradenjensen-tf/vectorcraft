@@ -705,16 +705,15 @@ fn artboards(s: &mut String, doc: &Document, to_art: Affine, origin: (f64, f64),
     let _ = writeln!(s, "%_{active} /Int (CropAreaActive) ,");
     let _ = writeln!(s, "%_{CANVAS_SIZE} /Int (AIDocumentCanvasSize) ,");
     // Document bleed (top, bottom, left, right) in points, written to the Document dictionary.
-    // Illustrator stores this as AIDocumentBleed with four Real values in [top, left, bottom, right] order.
+    // Illustrator stores this as four separate /Real entries: BleedTopValue, BleedLeftValue,
+    // BleedBottomValue, BleedRightValue, with the same syntax as other entries.
     let bleed = doc.setup.bleed;
     if bleed.iter().any(|b| *b > 0.0) {
-        s.push_str("%_/Array :\n");
-        // Order: [top, left, bottom, right] - Illustrator's internal order
-        for &b in &[bleed[0], bleed[2], bleed[1], bleed[3]] {
-            ps::push_num(s, b);
-            s.push_str(" /Real ,\n%_");
-        }
-        s.push_str("; (AIDocumentBleed) ,\n");
+        // VectorCraft bleed order: [top, bottom, left, right]
+        let _ = writeln!(s, "%_{} /Real (BleedTopValue) ,", ps::num(bleed[0]));
+        let _ = writeln!(s, "%_{} /Real (BleedBottomValue) ,", ps::num(bleed[1]));
+        let _ = writeln!(s, "%_{} /Real (BleedLeftValue) ,", ps::num(bleed[2]));
+        let _ = writeln!(s, "%_{} /Real (BleedRightValue) ,", ps::num(bleed[3]));
     }
     // The variable library, after the canvas size.
     s.push_str(library);

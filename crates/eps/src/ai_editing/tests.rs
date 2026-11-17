@@ -1589,24 +1589,33 @@ fn a_restored_document_opens_on_the_artboard_the_copy_names() {
 }
 
 /// Document bleed (top, bottom, left, right) is written to the Document dictionary as
-/// AIDocumentBleed and reads back with the same values. When all sides are zero, no entry
-/// is written.
+/// BleedTopValue, BleedBottomValue, BleedLeftValue, BleedRightValue and reads back with
+/// the same values. When all sides are zero, no entries are written.
 #[test]
 fn document_bleed_round_trips() {
     let mut doc = Document::new(200.0, 100.0);
     // No bleed: no entry.
     let p = program(&doc);
-    assert!(!p.contains("AIDocumentBleed"), "no bleed = no entry");
+    assert!(!p.contains("BleedTopValue"), "no bleed = no entry");
+    assert!(!p.contains("BleedBottomValue"), "no bleed = no entry");
+    assert!(!p.contains("BleedLeftValue"), "no bleed = no entry");
+    assert!(!p.contains("BleedRightValue"), "no bleed = no entry");
     // Uniform bleed.
     doc.setup.bleed = [9.0, 9.0, 9.0, 9.0];
     let p = program(&doc);
-    assert!(p.contains("(AIDocumentBleed)"), "bleed written: {p}");
+    assert!(p.contains("(BleedTopValue)"), "bleed written: {p}");
+    assert!(p.contains("(BleedBottomValue)"), "bleed written: {p}");
+    assert!(p.contains("(BleedLeftValue)"), "bleed written: {p}");
+    assert!(p.contains("(BleedRightValue)"), "bleed written: {p}");
     let back = read_back(&doc);
     assert_eq!(back.setup.bleed, [9.0, 9.0, 9.0, 9.0]);
-    // Uneven bleed: [top, bottom, left, right] in doc → [top, left, bottom, right] in AI.
+    // Uneven bleed: [top, bottom, left, right] in VectorCraft.
     doc.setup.bleed = [4.0, 2.0, 3.0, 1.0];
     let p = program(&doc);
-    assert!(p.contains("4 /Real ,\n%_3 /Real ,\n%_2 /Real ,\n%_1 /Real ,\n%_; (AIDocumentBleed)"), "{p}");
+    assert!(p.contains("4 /Real (BleedTopValue)"), "{p}");
+    assert!(p.contains("2 /Real (BleedBottomValue)"), "{p}");
+    assert!(p.contains("3 /Real (BleedLeftValue)"), "{p}");
+    assert!(p.contains("1 /Real (BleedRightValue)"), "{p}");
     let back = read_back(&doc);
     assert_eq!(back.setup.bleed, [4.0, 2.0, 3.0, 1.0]);
 }
@@ -5176,14 +5185,16 @@ fn scaled_area_type_and_type_on_a_path_stay_type() {
     assert!(matches!(texts[1].kind, TextKind::OnPath { .. }));
     assert_eq!(r3(texts[1].runs[0].style.size * k(texts[1])), "100.000");
 
+    // Unevenly scaled area type now stays type (the frame's shape is preserved by the writer).
     let mut doc = Document::new(200.0, 100.0);
     let layer = doc.layers[0].id;
     let mut uneven = framed("Uneven", Rect::new(10.0, 10.0, 50.0, 30.0));
     uneven.xf = Affine::new([2.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
     let uneven = text_node(&mut doc, uneven);
     doc.insert(Some(layer), usize::MAX, uneven).unwrap();
-    assert!(!program(&doc).contains("/AI11Text"));
+    assert!(program(&doc).contains("/AI11Text"));
 
+    // Threaded frames at two different scales are written as outlines (threads need uniform scaling).
     let mut doc = Document::new(200.0, 100.0);
     let layer = doc.layers[0].id;
     let first = framed("A story in two frames", Rect::new(10.0, 10.0, 50.0, 30.0));
