@@ -203,11 +203,26 @@ impl Ocgs {
     }
 
     /// The index of group `id` (dictionary `d`), noted if new (up to [`MAX_GROUPS`]).
+    /// An unlisted OCG with the same name as a listed one maps to it (PDF writers sometimes
+    /// duplicate OCG objects in form XObjects).
     fn note(&mut self, id: ObjectIdentifier, d: &Dict<'_>) -> Option<usize> {
-        match self.index.get(&id) {
-            Some(i) => Some(*i),
-            None => (self.list.len() < MAX_GROUPS).then(|| self.add(id, d, false)),
+        if let Some(i) = self.index.get(&id) {
+            return Some(*i);
         }
+        // Map an unlisted OCG to a listed one with the same name.
+        let name = d.get::<craft_pdf::syntax::object::String<'_>>(b"Name").map(|s| text_string(s.as_bytes())).unwrap_or_default();
+        if !name.is_empty() {
+            if let Some((&existing_id, &i)) = self.index.iter().find(|&(_, &i)| self.list.get(i).is_some_and(|g| g.name == name)) {
+                // Map this id to the same index as the existing one with the same name.
+                self.index.insert(id, i);
+                // Inherit the off state if the original is off.
+                if self.off.contains(&existing_id) {
+                    self.off.insert(id);
+                }
+                return Some(i);
+            }
+        }
+        (self.list.len() < MAX_GROUPS).then(|| self.add(id, d, false))
     }
 }
 
