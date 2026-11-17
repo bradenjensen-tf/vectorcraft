@@ -34,6 +34,9 @@ image = { workspace = true }
 craft-image-codecs = { workspace = true }
 flate2 = { workspace = true }
 ruzstd = { workspace = true }
+# Zstandard encoder (native builds only; wasm32 falls back to ruzstd).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zstd = { workspace = true }
 # Images read through `CCITTFaxDecode`.
 craft-stream-codecs = { workspace = true }
 # Live effects' params, as the art styles that name them give them.

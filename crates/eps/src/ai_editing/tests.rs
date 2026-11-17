@@ -13093,3 +13093,28 @@ fn a_cut_clipping_object_without_room_for_its_mask_gets_no_carrier() {
         }
     }
 }
+
+/// A document with ~20k paths at varying opacities compresses well: the Zstandard-compressed
+/// private data is no more than 25% of the uncompressed program size (level 9 gives ~8%).
+#[test]
+fn many_paths_compress_well() {
+    let mut doc = Document::new(1000.0, 1000.0);
+    let layer = doc.layers[0].id;
+    for i in 0..20_000 {
+        let x = (i % 100) as f64 * 10.0;
+        let y = (i / 100) as f64 * 5.0;
+        let opacity = ((i % 10) as f32 + 1.0) / 10.0;
+        let mut node = square(&mut doc, Rect::new(x, y, x + 8.0, y + 4.0), Color::gray(0.5));
+        node.opacity = opacity;
+        doc.insert(Some(layer), usize::MAX, node).unwrap();
+    }
+    let out = export_ai_editing(&doc, &opts()).unwrap();
+    let (p, _) = private_data(&doc, &opts()).unwrap();
+    // The compressed data should be much smaller than the uncompressed program.
+    // With zstd level 9, we get ~8% ratio; ruzstd Fastest gives ~40%.
+    // We allow up to 25% to give headroom for different platforms.
+    let compressed_len = p.data.len() - ZSTD_MARKER.len();
+    let uncompressed_len = out.program.len();
+    let ratio = compressed_len as f64 / uncompressed_len as f64;
+    assert!(ratio < 0.25, "compression ratio {:.1}% should be under 25% (compressed {compressed_len}, uncompressed {uncompressed_len})", ratio * 100.0);
+}
