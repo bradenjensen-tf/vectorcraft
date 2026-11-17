@@ -1588,6 +1588,29 @@ fn a_restored_document_opens_on_the_artboard_the_copy_names() {
     assert_eq!(crate::ai_opened_artboard(b"%AI24_ZStandard_Data not zstd", &doc), None);
 }
 
+/// Document bleed (top, bottom, left, right) is written to the Document dictionary as
+/// AIDocumentBleed and reads back with the same values. When all sides are zero, no entry
+/// is written.
+#[test]
+fn document_bleed_round_trips() {
+    let mut doc = Document::new(200.0, 100.0);
+    // No bleed: no entry.
+    let p = program(&doc);
+    assert!(!p.contains("AIDocumentBleed"), "no bleed = no entry");
+    // Uniform bleed.
+    doc.setup.bleed = [9.0, 9.0, 9.0, 9.0];
+    let p = program(&doc);
+    assert!(p.contains("(AIDocumentBleed)"), "bleed written: {p}");
+    let back = read_back(&doc);
+    assert_eq!(back.setup.bleed, [9.0, 9.0, 9.0, 9.0]);
+    // Uneven bleed: [top, bottom, left, right] in doc → [top, left, bottom, right] in AI.
+    doc.setup.bleed = [4.0, 2.0, 3.0, 1.0];
+    let p = program(&doc);
+    assert!(p.contains("4 /Real ,\n%_3 /Real ,\n%_2 /Real ,\n%_1 /Real ,\n%_; (AIDocumentBleed)"), "{p}");
+    let back = read_back(&doc);
+    assert_eq!(back.setup.bleed, [4.0, 2.0, 3.0, 1.0]);
+}
+
 /// A guide is its path followed by `(n) *` (closed) or `(N) *` (open), with no `(N) *` before
 /// it, and reads back as the same guide.
 #[test]

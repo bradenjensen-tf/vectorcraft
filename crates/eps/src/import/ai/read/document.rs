@@ -839,7 +839,8 @@ impl<'a> Reader<'a> {
 
     /// The `/Document` dictionary: the artboards and their display options, the active artboard
     /// (`CropAreaActive`, `/Int`: its index in the `ArtboardArray`, next to it), Document Raster
-    /// Effects Settings, its variable library (the first one read), and its Objects on Path records.
+    /// Effects Settings, document bleed (from `AIDocumentBleed`), its variable library (the first
+    /// one read), and its Objects on Path records.
     pub(super) fn document(&mut self, o: &Obj) {
         if !self.variables.present {
             self.variables = variable_library(o, &mut self.names);
@@ -847,6 +848,17 @@ impl<'a> Reader<'a> {
         self.constraint_data(o);
         if let Some(r) = find_entry(o, "AI Auto Rasterize", 0) {
             raster_settings(r, &mut self.doc);
+        }
+        // Document bleed: AIDocumentBleed is an array of [top, left, bottom, right] in points.
+        // The array's entries each hold a single Real value.
+        if let Some(holder) = find_holder(o, "AIDocumentBleed", 0) {
+            if let Some(array) = holder.obj("AIDocumentBleed") {
+                let bleed_vals: Vec<f64> = array.entries.iter().flat_map(|(_, vals)| vals.iter().filter_map(|v| v.num())).collect();
+                if let [top, left, bottom, right, ..] = bleed_vals.as_slice() {
+                    // Map to VectorCraft's [top, bottom, left, right] order.
+                    self.doc.setup.bleed = [*top, *bottom, *left, *right];
+                }
+            }
         }
         let Some(holder) = find_holder(o, "ArtboardArray", 0) else { return };
         let Some(list) = holder.obj("ArtboardArray") else { return };

@@ -704,6 +704,18 @@ fn artboards(s: &mut String, doc: &Document, to_art: Affine, origin: (f64, f64),
     s.push_str("%_; (ArtboardArray) ,\n");
     let _ = writeln!(s, "%_{active} /Int (CropAreaActive) ,");
     let _ = writeln!(s, "%_{CANVAS_SIZE} /Int (AIDocumentCanvasSize) ,");
+    // Document bleed (top, bottom, left, right) in points, written to the Document dictionary.
+    // Illustrator stores this as AIDocumentBleed with four Real values in [top, left, bottom, right] order.
+    let bleed = doc.setup.bleed;
+    if bleed.iter().any(|b| *b > 0.0) {
+        s.push_str("%_/Array :\n");
+        // Order: [top, left, bottom, right] - Illustrator's internal order
+        for &b in &[bleed[0], bleed[2], bleed[1], bleed[3]] {
+            ps::push_num(s, b);
+            s.push_str(" /Real ,\n%_");
+        }
+        s.push_str("; (AIDocumentBleed) ,\n");
+    }
     // The variable library, after the canvas size.
     s.push_str(library);
     s.push_str("%_; /Recorded ,\n%_/Dictionary : /NotRecorded ,\n%_; /NotRecorded ,\n%_;\n%AI9_EndDocumentData\n");
