@@ -711,3 +711,22 @@ fn opacity_masks_are_rasterized_with_their_look() {
     assert_eq!(masks, 0, "no transparency is left");
     assert!(changed(&before, &picture(&s)) < 0.02);
 }
+
+/// Groups that would exceed the region cap are rasterized whole instead: krilla's DICT_LEN (4095)
+/// limits how many XObject names one page can have.
+#[test]
+fn region_cap_prevents_too_many_regions() {
+    use crate::cmd::FlattenOptions;
+    let _settings = settings_lock();
+    let mut s = session();
+    for i in 0..100 {
+        let x = (i % 10) as f64 * 20.0;
+        let y = (i / 10) as f64 * 20.0;
+        rect(&mut s, x, y, 15.0, 15.0, if i % 2 == 0 { "#ff0000" } else { "#0000ff" });
+    }
+    run(&mut s, "select.all", json!({}));
+    run(&mut s, "transparency.set", json!({"opacity": 50}));
+    let (_, vector, _) = flatten(&mut s, json!({"balance": 100}));
+    assert!(vector as usize <= FlattenOptions::REGION_CAP,
+        "vector regions {} should not exceed cap {}", vector, FlattenOptions::REGION_CAP);
+}

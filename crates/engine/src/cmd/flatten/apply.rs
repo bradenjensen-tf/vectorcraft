@@ -476,11 +476,17 @@ fn flatten_group(plain: &[&Node], o: &FlattenOptions, cmyk: bool) -> Option<(Reg
     // An unclipped full raster needs no regions.
     let whole = o.balance <= 0.0 && !o.clip_complex_regions;
     // Nor does one that splits into more regions than the balance allows: the build stops at the
-    // first region past the limit.
+    // first region past the limit. A hard cap (REGION_CAP) prevents exceeding krilla's DICT_LEN.
     let (regions, over) = match o.region_limit().filter(|_| !every_region()) {
         _ if whole => (vec![], false),
-        Some(limit) => po::regions_within(&b.shapes, limit).map_or((vec![], true), |r| (r, false)),
-        None => (po::regions(&b.shapes), false),
+        Some(limit) => {
+            let cap = limit.min(FlattenOptions::REGION_CAP);
+            po::regions_within(&b.shapes, cap).map_or((vec![], true), |r| (r, false))
+        }
+        None => {
+            let cap = FlattenOptions::REGION_CAP;
+            po::regions_within(&b.shapes, cap).map_or((vec![], true), |r| (r, false))
+        }
     };
     // An arrangement that failed (degenerate geometry) leaves only rasterizing.
     let all = over || regions.is_empty() || o.rasterize_all(regions.len());

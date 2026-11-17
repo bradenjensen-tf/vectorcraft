@@ -180,6 +180,11 @@ impl FlattenOptions {
     pub(crate) fn region_limit(&self) -> Option<usize> {
         (!self.clip_complex_regions && self.balance > 0.0 && self.balance < 100.0).then(|| 10f64.powf(self.balance / 20.0).floor() as usize)
     }
+
+    /// The hard cap on regions per flattened group: krilla's dictionary limit is 4095 entries, and
+    /// each region needs at least one XObject name. We cap at 3900 to leave margin for other
+    /// resources the page may need.
+    pub(crate) const REGION_CAP: usize = 3900;
 }
 
 pub(super) fn flatten(s: &mut Session, p: &Value) -> Result<Value> {
