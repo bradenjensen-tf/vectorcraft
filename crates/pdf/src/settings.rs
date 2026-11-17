@@ -357,15 +357,22 @@ impl MarkSettings {
 }
 
 /// Bleed (Marks and Bleeds section), in points.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct BleedSettings {
-    /// Use the document's bleed instead of the values below.
+    /// Use the document's bleed instead of the values below. Defaults to true so that PDF export
+    /// honours the document bleed by default, matching Illustrator's convention.
     pub use_document: bool,
     pub top: f64,
     pub bottom: f64,
     pub left: f64,
     pub right: f64,
+}
+
+impl Default for BleedSettings {
+    fn default() -> Self {
+        Self { use_document: true, top: 0.0, bottom: 0.0, left: 0.0, right: 0.0 }
+    }
 }
 
 impl BleedSettings {

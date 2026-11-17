@@ -577,6 +577,35 @@ fn ai_export_uses_document_bleed_for_pdf_boxes() {
     assert_eq!((trim.width(), trim.height()), (612.0, 792.0), "TrimBox = artboard size");
 }
 
+/// Plain PDF export uses the document's bleed by default: MediaBox = BleedBox = artboard + bleed,
+/// TrimBox = artboard. This matches Illustrator's convention.
+#[test]
+fn pdf_export_uses_document_bleed_by_default() {
+    let mut s = Session::new();
+    // 400×300 artboard with uneven bleed.
+    s.execute("file.new", &json!({"width": 400, "height": 300})).unwrap();
+    s.execute("document.setup", &json!({"bleed": {"left": 5, "top": 10, "right": 15, "bottom": 20}})).unwrap();
+    s.execute("shape.rectangle", &json!({"x": 10, "y": 10, "width": 100, "height": 80})).unwrap();
+
+    // Export PDF without explicit bleed settings.
+    let pdf = b64(&s.execute("document.exportPdf", &json!({})).unwrap());
+    let info = vectorcraft_pdf::open_pdf(&pdf, None).unwrap().info();
+    let page = &info.pages[0];
+
+    let box_of = |crop: vectorcraft_pdf::CropTo| page.boxes.iter().find(|(c, _)| *c == crop).map(|(_, r)| *r);
+    let media = box_of(vectorcraft_pdf::CropTo::Media).expect("MediaBox");
+    let bleed = box_of(vectorcraft_pdf::CropTo::Bleed).unwrap_or(media);
+    let trim = box_of(vectorcraft_pdf::CropTo::Trim).unwrap_or(media);
+
+    // MediaBox = BleedBox = artboard + bleed: [0, 0, 400+5+15, 300+10+20].
+    assert_eq!((media.width(), media.height()), (420.0, 330.0), "MediaBox = artboard + bleed");
+    assert_eq!((bleed.x0, bleed.y0, bleed.x1, bleed.y1), (media.x0, media.y0, media.x1, media.y1), "BleedBox = MediaBox");
+
+    // TrimBox = artboard at [left_bleed, bottom_bleed, ...].
+    assert_eq!((trim.x0, trim.y0), (5.0, 20.0), "TrimBox origin = (left_bleed, bottom_bleed)");
+    assert_eq!((trim.width(), trim.height()), (400.0, 300.0), "TrimBox = artboard size");
+}
+
 /// A PDF import on its trim box (cropTo: trim) sets the document bleed from the gap between the
 /// trim and bleed boxes. The artboard size matches the trim box.
 #[test]

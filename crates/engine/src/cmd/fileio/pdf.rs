@@ -196,9 +196,10 @@ pub(crate) fn pdf_error(cmd: &str, e: PdfError) -> EngineError {
 /// The settings `p` asks for: its preset (built-in or one of `saved`; default
 /// [`DEFAULT_PRESET`]) with `p`'s options applied over it. Choosing another standard turns
 /// Preserve Editing off, the layers off where it has none, and sets the latest compatibility it
-/// allows, unless `p` asks for those. Checked as a preset is
-/// ([`PdfSettings::check_values`]): profiles that aren't there pass. Keys that aren't PDF options
-/// (path, format…) are ignored.
+/// allows, unless `p` asks for those. When explicit bleed values are provided without
+/// `useDocument`, the explicit values are used instead of the document's bleed. Checked as a
+/// preset is ([`PdfSettings::check_values`]): profiles that aren't there pass. Keys that aren't
+/// PDF options (path, format…) are ignored.
 pub fn resolve(cmd: &str, p: &Value, saved: &[PdfPreset]) -> Result<PdfSettings> {
     let base = preset_settings(cmd, p, saved)?;
     if !p.is_object() {
@@ -217,6 +218,15 @@ pub fn resolve(cmd: &str, p: &Value, saved: &[PdfPreset]) -> Result<PdfSettings>
         }
         if !s.standard.allows(s.compatibility) && unasked("compatibility") {
             s.compatibility = s.standard.version();
+        }
+    }
+    // When explicit bleed values are provided without `useDocument`, use them instead of the
+    // document's bleed. This allows the caller to override the default of using document bleed.
+    if let Some(bleed) = p.get("bleed").filter(|v| v.is_object()) {
+        let has_values = ["top", "bottom", "left", "right"].iter().any(|k| bleed.get(k).is_some_and(|v| !v.is_null()));
+        let asks_use_doc = bleed.get("useDocument").is_some_and(|v| !v.is_null());
+        if has_values && !asks_use_doc {
+            s.bleed.use_document = false;
         }
     }
     s.check_values().map_err(|e| pdf_error(cmd, e))?;
