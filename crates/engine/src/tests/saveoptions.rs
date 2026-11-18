@@ -698,3 +698,36 @@ fn the_preview_and_pdf_of_a_save_at_a_precision_show_the_rounded_art() {
     assert_eq!(preview, crate::cmd::fileio::preview_png(&vectorcraft_format::load(&file).unwrap()).unwrap());
     assert_ne!(preview, crate::cmd::fileio::preview_png(&s.doc().unwrap().doc).unwrap());
 }
+
+#[test]
+fn ai_embedded_json_has_rounded_floats() {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 100, "height": 100})).unwrap();
+    let anchors = json!([{"x": 10.123456789, "y": 20.987654321}, {"x": 80.555555555, "y": 30.777777777}]);
+    s.execute("path.create", &json!({"anchors": anchors, "closed": true})).unwrap();
+    // PDF-compatible .ai file - native data embedded in PDF's EmbeddedFiles
+    let ai_bytes = bytes_of(&s.execute("file.saveCopy", &json!({"format": "ai", "pdfCompatible": true})).unwrap()["dataBase64"]);
+    let editing = vectorcraft_pdf::editing(&ai_bytes).expect("editing data in PDF-compatible .ai");
+    let json_text = String::from_utf8_lossy(&editing.data);
+    assert!(!json_text.contains("10.123456789"), "unrounded X coordinate in native JSON");
+    assert!(!json_text.contains("20.987654321"), "unrounded Y coordinate in native JSON");
+    assert!(!json_text.contains("80.555555555"), "unrounded X coordinate in native JSON");
+    assert!(!json_text.contains("30.777777777"), "unrounded Y coordinate in native JSON");
+    assert!(json_text.contains("10.1235") || json_text.contains("10.1234"), "expected rounded X in PDF-compatible .ai: {}", &json_text[..200.min(json_text.len())]);
+}
+
+#[test]
+fn eps_embedded_json_has_rounded_floats() {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 100, "height": 100})).unwrap();
+    let anchors = json!([{"x": 10.123456789, "y": 20.987654321}, {"x": 80.555555555, "y": 30.777777777}]);
+    s.execute("path.create", &json!({"anchors": anchors, "closed": true})).unwrap();
+    let eps_bytes = bytes_of(&s.execute("file.saveCopy", &json!({"format": "eps"})).unwrap()["dataBase64"]);
+    let native_json = vectorcraft_eps::native(&eps_bytes).expect("native data in EPS");
+    let json_text = String::from_utf8_lossy(&native_json);
+    assert!(!json_text.contains("10.123456789"), "unrounded X coordinate in EPS native JSON");
+    assert!(!json_text.contains("20.987654321"), "unrounded Y coordinate in EPS native JSON");
+    assert!(!json_text.contains("80.555555555"), "unrounded X coordinate in EPS native JSON");
+    assert!(!json_text.contains("30.777777777"), "unrounded Y coordinate in EPS native JSON");
+    assert!(json_text.contains("10.1235") || json_text.contains("10.1234"), "expected rounded X in EPS: {}", &json_text[..200.min(json_text.len())]);
+}
