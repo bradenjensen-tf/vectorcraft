@@ -530,7 +530,20 @@ fn flatten_group(plain: &[&Node], o: &FlattenOptions, cmyk: bool) -> Option<(Reg
             // Over-cap rasters for no-transparency output need a clip (the group outline) so
             // render_raster sets no_alpha and makes them opaque. Without it they keep their alpha
             // channel and cause soft masks.
-            Some(PathData::new(b.shapes.iter().flat_map(|s| s.path.subpaths.iter().cloned()).collect()))
+            //
+            // Build the clip as a proper union of the shapes' paths. Simply concatenating subpaths
+            // causes holes where shapes with opposite winding overlap and cancel under nonzero fill.
+            // If the union fails (too complex), fall back to the bounding box—the raster already
+            // covers the group's composite, so the box clips nothing visible.
+            let refs: Vec<(&PathData, FillRule)> = b.shapes.iter().map(|s| (&s.path, s.rule)).collect();
+            let union = po::unite_all(&refs);
+            let clip_path = if union.is_empty() {
+                // Union failed or empty; use bounding box as fallback.
+                shapes::rectangle(rect)
+            } else {
+                union
+            };
+            Some(clip_path)
         } else {
             o.clip_complex_regions.then(|| PathData::new(complex.iter().flat_map(|&k| regions[k].path.subpaths.iter().cloned()).collect()))
         };

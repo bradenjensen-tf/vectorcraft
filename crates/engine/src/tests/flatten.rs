@@ -790,3 +790,42 @@ fn multi_group_flattens_all_for_no_transparency() {
         assert!(!n.shows_transparency(), "flattened group {id} should be opaque");
     }
 }
+
+/// An over-cap group with shapes of opposite winding must not punch holes in the flattened result.
+/// The clip should be a proper union, not concatenated subpaths that cancel under nonzero fill.
+#[test]
+fn over_cap_union_clip_covers_opposite_winding_shapes() {
+    let _settings = settings_lock();
+    let mut s = session();
+    // Create a large outer square.
+    let outer_id = rect(&mut s, 10.0, 10.0, 180.0, 180.0, "#00ff00");
+    // Create a smaller inner square with opposite winding by reversing its path.
+    let inner_id = rect(&mut s, 50.0, 50.0, 100.0, 100.0, "#ff0000");
+    // Reverse the inner path to create opposite winding.
+    run(&mut s, "path.reverse", json!({"ids": [inner_id]}));
+    // Apply transparency to both shapes.
+    run(&mut s, "transparency.set", json!({"ids": [outer_id], "opacity": 80}));
+    run(&mut s, "transparency.set", json!({"ids": [inner_id], "opacity": 80, "blendMode": "multiply"}));
+    // Flatten with no_transparency and balance=0 to force over-cap rasterization.
+    run(&mut s, "select.all", json!({}));
+    let (ids, _, rasterized) = flatten(&mut s, json!({"balance": 0, "noTransparency": true}));
+    assert!(rasterized >= 1, "should have rasterized the group");
+    // The flattened image must be opaque.
+    for id in ids {
+        let n = node(&s, id);
+        assert!(!n.shows_transparency(), "flattened node {id} should be opaque");
+    }
+    // Verify via the image: the inner square area should NOT be white (no hole).
+    // Export as PNG and check center pixel.
+    let png = run(&mut s, "document.export", json!({"format": "png", "ppi": 72}));
+    let data = vectorcraft_format::base64_decode(png["dataBase64"].as_str().unwrap()).unwrap();
+    let img = image::load_from_memory(&data).unwrap().into_rgba8();
+    // Check center of inner square (100, 100 in a 200x200 doc).
+    let (cx, cy) = (100, 100);
+    let pixel = img.get_pixel(cx, cy);
+    // The pixel should NOT be white/near-white (would indicate a hole).
+    let is_white = pixel.0[0] > 240 && pixel.0[1] > 240 && pixel.0[2] > 240;
+    assert!(!is_white, "center pixel should not be white (hole in clip): {:?}", pixel.0);
+    // And should have some color (not transparent).
+    assert!(pixel.0[3] > 200, "center pixel should be opaque: alpha={}", pixel.0[3]);
+}
