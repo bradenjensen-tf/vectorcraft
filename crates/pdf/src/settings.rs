@@ -357,11 +357,13 @@ impl MarkSettings {
 }
 
 /// Bleed (Marks and Bleeds section), in points.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct BleedSettings {
     /// Use the document's bleed instead of the values below. Defaults to true so that PDF export
-    /// honours the document bleed by default, matching Illustrator's convention.
+    /// honours the document bleed by default, matching Illustrator's convention. When explicit
+    /// bleed values are provided without an explicit `useDocument`, this is set to false so the
+    /// explicit values take effect.
+    #[serde(rename = "useDocument")]
     pub use_document: bool,
     pub top: f64,
     pub bottom: f64,
@@ -372,6 +374,31 @@ pub struct BleedSettings {
 impl Default for BleedSettings {
     fn default() -> Self {
         Self { use_document: true, top: 0.0, bottom: 0.0, left: 0.0, right: 0.0 }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BleedSettings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Raw {
+            use_document: Option<bool>,
+            #[serde(default)]
+            top: f64,
+            #[serde(default)]
+            bottom: f64,
+            #[serde(default)]
+            left: f64,
+            #[serde(default)]
+            right: f64,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let has_values = raw.top != 0.0 || raw.bottom != 0.0 || raw.left != 0.0 || raw.right != 0.0;
+        let use_document = raw.use_document.unwrap_or(!has_values);
+        Ok(BleedSettings { use_document, top: raw.top, bottom: raw.bottom, left: raw.left, right: raw.right })
     }
 }
 
