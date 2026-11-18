@@ -91,6 +91,183 @@ fn find_preservable_spot_indices(
     result
 }
 
+/// Collect all spot color names used in a node tree.
+fn collect_spot_names(doc: &Document, nodes: &[Node]) -> Vec<String> {
+    let spot_swatches: HashSet<String> = doc.spot_names().into_iter().collect();
+    if spot_swatches.is_empty() {
+        return vec![];
+    }
+    
+    let mut found = HashSet::new();
+    for n in nodes {
+        collect_spots_in_node(&spot_swatches, n, &mut found);
+    }
+    found.into_iter().collect()
+}
+
+/// Recursively collect spot names from a node.
+fn collect_spots_in_node(spot_swatches: &HashSet<String>, n: &Node, found: &mut HashSet<String>) {
+    if !n.visible {
+        return;
+    }
+    
+    for item in &n.appearance.items {
+        if let Some(name) = paint_spot_name(item.paint(), spot_swatches) {
+            found.insert(name);
+        }
+    }
+    
+    if let Some(children) = n.children() {
+        for child in children {
+            collect_spots_in_node(spot_swatches, child, found);
+        }
+    }
+}
+
+/// Get the spot swatch name from a paint if it's linked to a spot.
+fn paint_spot_name(paint: &Paint, spot_swatches: &HashSet<String>) -> Option<String> {
+    match paint {
+        Paint::Solid { swatch: Some(name), .. } if spot_swatches.contains(name) => Some(name.clone()),
+        Paint::Gradient(g) => {
+            for stop in &g.gradient.stops {
+                if let Some(name) = &stop.swatch {
+                    if spot_swatches.contains(name) {
+                        return Some(name.clone());
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Create a copy of the art with colors recolored for spot tint extraction.
+/// Colors linked to `spot_name` become grayscale (tint as gray value).
+/// All other colors become transparent.
+fn recolor_for_spot(art: &[Node], spot_name: &str) -> Vec<Node> {
+    art.iter().map(|n| recolor_node_for_spot(n, spot_name)).collect()
+}
+
+fn recolor_node_for_spot(n: &Node, spot_name: &str) -> Node {
+    let mut n = n.clone();
+    if !n.visible {
+        return n;
+    }
+    
+    for item in &mut n.appearance.items {
+        let paint = item.paint_mut();
+        *paint = recolor_paint_for_spot(paint, spot_name);
+    }
+    
+    if let Some(children) = n.children_mut() {
+        for child in children {
+            *child = Arc::new(recolor_node_for_spot(child, spot_name));
+        }
+    }
+    
+    n
+}
+
+fn recolor_paint_for_spot(paint: &Paint, spot_name: &str) -> Paint {
+    match paint {
+        Paint::Solid { swatch: Some(name), tint, .. } if name == spot_name => {
+            // Convert to grayscale where tint becomes the gray value (1.0 = black = full ink)
+            Paint::Solid { color: Color::gray(*tint), swatch: None, tint: 1.0 }
+        }
+        Paint::Gradient(g) => {
+            let mut g = g.clone();
+            let mut has_spot = false;
+            for stop in &mut g.gradient.stops {
+                if stop.swatch.as_deref() == Some(spot_name) {
+                    has_spot = true;
+                    stop.color = Color::gray(stop.tint);
+                    stop.swatch = None;
+                    stop.tint = 1.0;
+                } else {
+                    // Other colors become transparent
+                    stop.opacity = 0.0;
+                }
+            }
+            if has_spot {
+                Paint::Gradient(g)
+            } else {
+                Paint::None
+            }
+        }
+        _ => Paint::None, // Non-spot colors become transparent
+    }
+}
+
+/// Render a spot tint image for one spot color.
+/// Returns grayscale pixels where the value is the tint amount (0 = no ink, 255 = full ink).
+fn render_spot_tint(
+    doc: &Document,
+    art: &[Node],
+    spot_name: &str,
+    region: Rect,
+    scale: f64,
+) -> Option<Vec<u8>> {
+    let recolored = recolor_for_spot(art, spot_name);
+    let tmp = isolated_doc(doc, recolored);
+    
+    let mut r = vectorcraft_render::Renderer::new();
+    let _opts = vectorcraft_render::RenderOptions { 
+        background: Some([255, 255, 255, 255]),
+        skip_templates: true, 
+        ..Default::default() 
+    };
+    
+    let img = r.render_region(&tmp, region, scale, false);
+    vectorcraft_doc::cancel::check().ok()?;
+    
+    // Extract grayscale from the rendered image.
+    // The recolored art renders spot tint as grayscale where:
+    // - Black (0) = full ink coverage
+    // - White (255) = no ink
+    // The colorize mechanism uses ImageBlob::coverage() which inverts:
+    // - Black input → high coverage output
+    // So we keep the rendered values as-is (don't invert).
+    let mut tint = Vec::with_capacity(img.pixels.len() / 4);
+    for chunk in img.pixels.chunks(4) {
+        // Use red channel (all channels should be the same for grayscale).
+        // Alpha blending: where alpha < 255, blend toward white (no ink).
+        let pixel = chunk[0];
+        let alpha = chunk[3];
+        // Blend: white (255) where alpha=0, pixel where alpha=255
+        let blended = 255 - ((255 - pixel) as u32 * alpha as u32 / 255) as u8;
+        tint.push(blended);
+    }
+    
+    Some(tint)
+}
+
+/// Get the CMYK alternate color at 100% tint for a spot swatch.
+fn spot_alternate(doc: &Document, spot_name: &str) -> [f32; 4] {
+    for swatch in &doc.swatches {
+        if swatch.spot && swatch.name == spot_name {
+            if let Paint::Solid { color, .. } = &swatch.paint {
+                return color.to_cmyk();
+            }
+        }
+    }
+    [0.0, 0.0, 0.0, 0.0]
+}
+
+/// Encode grayscale pixels as a PNG.
+fn grayscale_png(width: u32, height: u32, pixels: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    let img = craft_image_codecs::Image::from_raw(
+        width,
+        height,
+        craft_image_codecs::ChannelLayout::Gray,
+        craft_image_codecs::SampleType::U8,
+        pixels.to_vec(),
+    )
+    .map_err(|e| e.to_string())?;
+    craft_image_codecs::encode(&img, craft_image_codecs::Format::Png, &craft_image_codecs::EncodeOptions::default())
+        .map_err(|e| e.to_string())
+}
+
 // ---------- plan ----------
 
 /// What the flattening does, worked out before the document changes.
@@ -185,6 +362,20 @@ struct Raster {
     height: u32,
     xf: Affine,
     clip: Option<PathData>,
+    /// Spot ink tint images: (spot name, CMYK alternate at 100%, grayscale tint image).
+    /// Each spot image has the same dimensions and transform as the main image.
+    /// Pixels are grayscale tint values (0 = no ink, 255 = full tint).
+    spot_images: Vec<SpotImage>,
+}
+
+/// A spot color tint image for one ink.
+pub(super) struct SpotImage {
+    /// The spot swatch name.
+    pub(super) name: String,
+    /// The CMYK alternate color at 100% tint.
+    pub(super) alternate: [f32; 4],
+    /// Grayscale tint image (same dimensions as the main raster).
+    pub(super) blob: ImageBlob,
 }
 
 /// The flattening of `roots` with `o`; `render` renders the images (the preview only needs where
@@ -809,6 +1000,13 @@ fn render_raster(doc: &Document, art: &[Node], rect: Rect, ppi: f64, clip: Optio
     let tmp = isolated_doc(doc, art.to_vec());
     let mut r = vectorcraft_render::Renderer::new();
     let no_alpha = o.no_transparency.is_some() && clip.is_some() && !o.preserve_alpha;
+    // Collect spot colors used in the art for per-ink rendering
+    let spot_names = if no_alpha && doc.color_mode == ColorMode::Cmyk {
+        collect_spot_names(doc, art)
+    } else {
+        vec![]
+    };
+    
     if no_alpha && doc.color_mode == ColorMode::Cmyk {
         // Drawn as inks over the paper: as screen colours, the file would separate them again,
         // and a CMYK colour comes back with other inks (K moves into C, M and Y).
@@ -818,7 +1016,23 @@ fn render_raster(doc: &Document, art: &[Node], rect: Rect, ppi: f64, clip: Optio
         let (width, height) = vectorcraft_render::region_pixels(region, scale);
         // Past the size of a CMYK image: drawn in screen colours, below.
         if let Some(blob) = Inks::new(width, height, inks).and_then(|i| ImageBlob::cmyk_tiff(&i)) {
-            return Ok(Raster { blob, width, height, xf, clip });
+            // Render spot tint images for each spot color used
+            let mut spot_images = vec![];
+            for spot_name in &spot_names {
+                if let Some(tint_pixels) = render_spot_tint(doc, art, spot_name, region, scale) {
+                    // Get the CMYK alternate for this spot
+                    let alternate = spot_alternate(doc, spot_name);
+                    // Encode as grayscale PNG
+                    if let Ok(png) = grayscale_png(width, height, &tint_pixels) {
+                        spot_images.push(SpotImage {
+                            name: spot_name.clone(),
+                            alternate,
+                            blob: ImageBlob::new("image/png", png),
+                        });
+                    }
+                }
+            }
+            return Ok(Raster { blob, width, height, xf, clip, spot_images });
         }
     }
     let mut img = r.render_region(&tmp, region, scale, !o.preserve_alpha);
@@ -865,7 +1079,7 @@ fn render_raster(doc: &Document, art: &[Node], rect: Rect, ppi: f64, clip: Optio
         }
     }
     let png = img.to_png().map_err(|e| EngineError::Other(format!("Flatten Transparency: {e}")))?;
-    Ok(Raster { blob: ImageBlob::new("image/png", png), width: img.width, height: img.height, xf, clip })
+    Ok(Raster { blob: ImageBlob::new("image/png", png), width: img.width, height: img.height, xf, clip, spot_images: vec![] })
 }
 
 /// Pixels per point of an image of `rect` at `ppi`: lower when the image would be larger than
@@ -994,10 +1208,13 @@ pub(super) fn apply(d: &mut Document, sel: &mut vectorcraft_doc::Selection, plan
             continue;
         }
         let mut children = vec![];
-        // The image goes under the regions, reaching a pixel past its own: their edges then fall on
+        // The images go under the regions, reaching a pixel past their own: their edges then fall on
         // matching pixels instead of on what is behind the group.
+        // raster_nodes returns the main CMYK image first, then spot tint images layered above it.
         if let Some(r) = f.raster {
-            children.push(Arc::new(raster_node(d, r)));
+            for node in raster_nodes(d, r) {
+                children.push(Arc::new(node));
+            }
             rasterized += 1;
         }
         // Type over several lines gives a group per line.
@@ -1142,7 +1359,12 @@ fn kept_seen(n: &Node) {
 fn kept_seen(_: &Node) {}
 
 /// An image of `r` (in a clip group when it is clipped).
-fn raster_node(d: &mut Document, r: Raster) -> Node {
+/// Create nodes from a raster: the main image and any spot tint images.
+/// Spot images use colorize to output as Separation colorspaces with overprint.
+fn raster_nodes(d: &mut Document, r: Raster) -> Vec<Node> {
+    let mut nodes = vec![];
+    
+    // Main CMYK image
     let key = unique_key(d, "flattened");
     d.images.insert(key.clone(), r.blob);
     let image = Node::new(
@@ -1157,8 +1379,54 @@ fn raster_node(d: &mut Document, r: Raster) -> Node {
             pixels: None,
         })),
     );
-    let Some(path) = r.clip else { return image };
-    crate::cmd::rasterfx::clip_group(d, path, FillRule::NonZero, image)
+    
+    let main_node = match &r.clip {
+        Some(path) => crate::cmd::rasterfx::clip_group(d, path.clone(), FillRule::NonZero, image),
+        None => image,
+    };
+    nodes.push(main_node);
+    
+    // Spot tint images: each is a grayscale image colorized with the spot color
+    // Output: the coverage shows where the ink goes, colorize makes it print as that spot
+    for spot in r.spot_images {
+        let key = unique_key(d, &format!("spot_{}", spot.name.replace(' ', "_")));
+        d.images.insert(key.clone(), spot.blob);
+        
+        // Create a solid paint linked to the spot swatch at 100% tint.
+        // The grayscale pixels in the image act as the tint amount.
+        let colorize = Paint::Solid {
+            color: Color::cmyk(spot.alternate[0], spot.alternate[1], spot.alternate[2], spot.alternate[3]),
+            swatch: Some(spot.name.clone()),
+            tint: 1.0,
+        };
+        
+        let mut spot_image = Node::new(
+            d.alloc_id(),
+            NodeKind::Image(Box::new(ImageObject {
+                key,
+                width: r.width,
+                height: r.height,
+                xf: r.xf,
+                link: None,
+                placement: Default::default(),
+                pixels: None,
+            })),
+        );
+        spot_image.extras_mut().colorize = Some(Box::new(colorize));
+        
+        // Set overprint for spot images so they composite correctly with CMYK underneath
+        for item in &mut spot_image.appearance.items {
+            *item.overprint_mut() = true;
+        }
+        
+        let spot_node = match &r.clip {
+            Some(path) => crate::cmd::rasterfx::clip_group(d, path.clone(), FillRule::NonZero, spot_image),
+            None => spot_image,
+        };
+        nodes.push(spot_node);
+    }
+    
+    nodes
 }
 
 /// Do what [`Kept`] `k` found to its object of `d` (`brushes`: the document's brushes, for the
