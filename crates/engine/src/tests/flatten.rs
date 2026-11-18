@@ -730,3 +730,63 @@ fn region_cap_prevents_too_many_regions() {
     assert!(vector as usize <= FlattenOptions::REGION_CAP,
         "vector regions {} should not exceed cap {}", vector, FlattenOptions::REGION_CAP);
 }
+
+/// Over-cap groups (rasterized whole) with no_transparency set must be opaque: they get a clip
+/// (the group outline) so render_raster sets no_alpha.
+#[test]
+fn over_cap_groups_for_no_transparency_are_opaque() {
+    let _settings = settings_lock();
+    let mut s = session();
+    // Create many overlapping shapes to exceed REGION_CAP.
+    for i in 0..150 {
+        let x = (i % 15) as f64 * 12.0;
+        let y = (i / 15) as f64 * 18.0;
+        rect(&mut s, x, y, 20.0, 25.0, if i % 2 == 0 { "#ff0000" } else { "#0000ff" });
+    }
+    // Add a semi-transparent image in the middle.
+    let alpha_png = {
+        let img = image::RgbaImage::from_pixel(10, 10, image::Rgba([128, 64, 32, 180]));
+        let mut out = std::io::Cursor::new(vec![]);
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    };
+    run(&mut s, "file.place", json!({"name": "alpha.png", "dataBase64": vectorcraft_format::base64_encode(&alpha_png), "at": [80, 80]}));
+    run(&mut s, "select.all", json!({}));
+    run(&mut s, "transparency.set", json!({"opacity": 90}));
+    // Flatten with no_transparency (simulating PDF/X-1a).
+    let (ids, _, rasterized) = flatten(&mut s, json!({"balance": 100, "noTransparency": true}));
+    assert!(rasterized >= 1, "should rasterize the over-cap group");
+    // The rasterized image must be opaque (no shows_transparency).
+    for id in ids {
+        let n = node(&s, id);
+        assert!(!n.shows_transparency(), "flattened group {id} should be opaque");
+    }
+}
+
+/// Multiple overlapping transparent groups at the layer level must all be flattened for
+/// no-transparency output.
+#[test]
+fn multi_group_flattens_all_for_no_transparency() {
+    let _settings = settings_lock();
+    let mut s = session();
+    // Create multiple separate groups of overlapping transparent shapes.
+    for group_idx in 0..3 {
+        let base_x = group_idx as f64 * 60.0;
+        // Create overlapping transparent shapes.
+        for i in 0..6 {
+            let x = base_x + (i % 3) as f64 * 12.0;
+            let y = (i / 3) as f64 * 12.0 + 10.0;
+            let id = rect(&mut s, x, y, 20.0, 20.0, if i % 2 == 0 { "#ff0000" } else { "#00ff00" });
+            run(&mut s, "select.set", json!({"ids": [id]}));
+            run(&mut s, "transparency.set", json!({"opacity": 50 + group_idx * 10, "blendMode": "multiply"}));
+        }
+    }
+    run(&mut s, "select.all", json!({}));
+    // Flatten with no_transparency.
+    let (ids, _, _) = flatten(&mut s, json!({"noTransparency": true}));
+    // No node should show transparency after flattening.
+    for id in ids {
+        let n = node(&s, id);
+        assert!(!n.shows_transparency(), "flattened group {id} should be opaque");
+    }
+}

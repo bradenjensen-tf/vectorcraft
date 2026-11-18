@@ -165,7 +165,7 @@ impl FlattenOptions {
     }
 
     /// `n` shows an image whose see-through pixels count as transparency.
-    pub(super) fn draws_see_through_image(&self, n: &Node) -> bool {
+    pub(crate) fn draws_see_through_image(&self, n: &Node) -> bool {
         self.no_transparency.as_ref().is_some_and(|keys| draws_image(n, keys))
     }
 

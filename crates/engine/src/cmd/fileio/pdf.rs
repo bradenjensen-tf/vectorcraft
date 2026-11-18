@@ -465,10 +465,56 @@ fn flatten_for(cmd: &str, doc: &Document, set: &PdfSettings, p: &Value) -> Resul
     // Without soft masks a rasterized area can't be a rectangle with see-through pixels around
     // its art: it is clipped to its regions (opaque inside them).
     o.clip_complex_regions = true;
-    Ok(match flatten_document(shown.as_ref().unwrap_or(doc), &o)? {
+    let mut flat = flatten_document(shown.as_ref().unwrap_or(doc), &o)?;
+    // Safety net: flatten up to 3 more times if transparency remains (e.g. nested blend modes,
+    // multi-clip-group structures the first pass didn't catch).
+    for _ in 0..3 {
+        let d = flat.as_ref().or(shown.as_ref()).unwrap_or(doc);
+        if !d.layers.iter().any(|l| o.shows_transparency(d, l) || o.draws_see_through_image(l)) {
+            break;
+        }
+        flat = flatten_document(d, &o)?.or(flat);
+    }
+    // Final check: if transparency still remains, fail with the offending node ids.
+    if let Some(d) = flat.as_ref().or(shown.as_ref()) {
+        let remaining: Vec<_> = remaining_transparency(d, &o);
+        if !remaining.is_empty() {
+            return Err(bad(
+                cmd,
+                format!(
+                    "transparency remains after flattening: {} nodes ({:?})",
+                    remaining.len(),
+                    remaining.iter().take(10).collect::<Vec<_>>()
+                ),
+            ));
+        }
+    }
+    Ok(match flat {
         Some(flat) => (Some(flat), true),
         None => (shown, false),
     })
+}
+
+/// Node IDs that still show transparency in `doc` with flattener options `o`.
+fn remaining_transparency(doc: &Document, o: &FlattenOptions) -> Vec<vectorcraft_doc::NodeId> {
+    fn collect(doc: &Document, n: &Node, o: &FlattenOptions, out: &mut Vec<vectorcraft_doc::NodeId>) {
+        if !n.visible {
+            return;
+        }
+        if o.shows_transparency(doc, n) || o.draws_see_through_image(n) {
+            out.push(n.id);
+        }
+        if let Some(ch) = n.children() {
+            for c in ch {
+                collect(doc, c, o, out);
+            }
+        }
+    }
+    let mut out = vec![];
+    for l in &doc.layers {
+        collect(doc, l, o, &mut out);
+    }
+    out
 }
 
 /// The pages `opts` export of `doc` drawn on white, [`THUMBNAIL_SIZE`] pixels on their long side:

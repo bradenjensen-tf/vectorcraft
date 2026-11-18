@@ -526,7 +526,14 @@ fn flatten_group(plain: &[&Node], o: &FlattenOptions, cmyk: bool) -> Option<(Reg
     }
     let raster_rect = if all { plain.iter().filter_map(|n| reach(n)).reduce(|a, b| a.union(b)) } else { bounds(&complex) };
     let area = raster_rect.map(|rect| {
-        let clip = o.clip_complex_regions.then(|| PathData::new(complex.iter().flat_map(|&k| regions[k].path.subpaths.iter().cloned()).collect()));
+        let clip = if all && o.no_transparency.is_some() && !o.preserve_alpha {
+            // Over-cap rasters for no-transparency output need a clip (the group outline) so
+            // render_raster sets no_alpha and makes them opaque. Without it they keep their alpha
+            // channel and cause soft masks.
+            Some(PathData::new(b.shapes.iter().flat_map(|s| s.path.subpaths.iter().cloned()).collect()))
+        } else {
+            o.clip_complex_regions.then(|| PathData::new(complex.iter().flat_map(|&k| regions[k].path.subpaths.iter().cloned()).collect()))
+        };
         let ppi = if gradients_only { o.gradient_ppi } else { o.line_art_ppi };
         Area { rect, ppi, clip: clip.filter(|c| !c.is_empty()), whole: all }
     });
