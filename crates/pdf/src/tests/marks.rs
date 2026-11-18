@@ -87,9 +87,12 @@ fn a_pdfx_file_leaves_out_the_document_bleed_side_by_side() {
     let x4 = |bleed: serde_json::Value| settings(json!({"standard": "pdfX4", "bleed": bleed}));
     let mut d = doc();
     d.setup.bleed = [6.0, 0.0, 0.0, 0.0];
-    assert!(x4(json!({})).leaves_out_bleed(&d));
-    assert!(x4(json!({"bottom": 1})).leaves_out_bleed(&d), "the top is left out");
-    assert!(!x4(json!({"top": 1})).leaves_out_bleed(&d), "the sides without a document bleed don't count");
+    // Default is now use_document: true, so empty bleed settings use the document bleed.
+    assert!(!x4(json!({})).leaves_out_bleed(&d), "default uses document bleed");
+    // Explicit useDocument: false leaves out the document bleed.
+    assert!(x4(json!({"useDocument": false})).leaves_out_bleed(&d), "explicit useDocument: false leaves it out");
+    assert!(x4(json!({"useDocument": false, "bottom": 1})).leaves_out_bleed(&d), "the top is left out");
+    assert!(!x4(json!({"useDocument": false, "top": 1})).leaves_out_bleed(&d), "the sides without a document bleed don't count");
     assert!(!x4(json!({"useDocument": true})).leaves_out_bleed(&d));
     assert!(!settings(json!({})).leaves_out_bleed(&d), "not a PDF/X file");
     // A document bleed read from a file counts as it is kept in range.
