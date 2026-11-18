@@ -1157,32 +1157,26 @@ fn pdfx_1a_process_tile_excludes_spot_ink() {
     assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
 }
 
-/// End-to-end test: "All" registration spot gets a DeviceN with all colorants.
-/// "All" in PDF is a special separation colorant that paints every plate.
+/// End-to-end test: [Registration] gets a DeviceN with all colorants.
+/// [Registration] paints every plate (CMYK + all spots), written as colorant "All".
 #[test]
-fn pdfx_1a_all_spot_paints_every_plate() {
+fn pdfx_1a_registration_paints_every_plate() {
     let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut s = Session::new();
     run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
     
-    // Add an "All" spot swatch (registration colorant).
-    s.execute("swatch.new", &json!({
-        "name": "All",
-        "spot": true,
-        "color": {"c": 1.0, "m": 1.0, "y": 1.0, "k": 1.0}
-    })).unwrap();
-    
-    // Also add a regular spot to verify "All" includes it.
+    // Add a regular spot to verify [Registration] includes it in its DeviceN.
     s.execute("swatch.new", &json!({
         "name": "RegularSpot",
         "spot": true,
         "color": {"c": 0.0, "m": 1.0, "y": 0.0, "k": 0.0}
     })).unwrap();
     
-    // Create a shape with the "All" fill.
-    let all_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 10.0, "width": 80.0, "height": 80.0}))["id"].as_u64().unwrap();
-    run(&mut s, "paint.setFill", json!({"ids": [all_id], "swatch": "All"}));
-    run(&mut s, "paint.setStroke", json!({"ids": [all_id], "none": true}));
+    // Create a shape with [Registration] fill (the built-in swatch that paints every plate).
+    // [Registration] is not a spot swatch but is treated specially.
+    let reg_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 10.0, "width": 80.0, "height": 80.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [reg_id], "swatch": "[Registration]"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [reg_id], "none": true}));
     
     // Create a semi-transparent overlay to trigger flattening.
     let overlay_id = run(&mut s, "shape.rectangle", json!({"x": 30.0, "y": 30.0, "width": 60.0, "height": 60.0}))["id"].as_u64().unwrap();
@@ -1200,13 +1194,13 @@ fn pdfx_1a_all_spot_paints_every_plate() {
     let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
     let text = String::from_utf8_lossy(&bytes);
     
-    // The PDF should have a DeviceN with process colorants for "All".
-    // "All" paints every plate, so the DeviceN should contain Cyan, Magenta, Yellow, Black.
+    // The PDF should have a DeviceN with process colorants for [Registration].
+    // [Registration] paints every plate, so the DeviceN should contain Cyan, Magenta, Yellow, Black.
     let has_process_colorants = text.contains("/Cyan") && text.contains("/Magenta") 
         && text.contains("/Yellow") && text.contains("/Black");
     
     assert!(has_process_colorants,
-        "\"All\" spot should create DeviceN with process colorants (Cyan/Magenta/Yellow/Black)");
+        "[Registration] should create DeviceN with process colorants (Cyan/Magenta/Yellow/Black)");
     
     // Verify it was flattened.
     let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
@@ -1263,4 +1257,111 @@ fn pdfx_1a_spot_with_special_characters_in_name() {
     // Verify it was flattened.
     let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
     assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}
+
+/// Test: consecutive overprint spot paths in a flat layer next to transparent groups are preserved.
+/// Repro for DWS-RS Check_Text: 156 consecutive paths with spot fills, overprint=true, opacity=1,
+/// in a flat layer that also has transparency groups.
+#[test]
+fn pdfx_1a_many_consecutive_overprint_spot_paths_preserved() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 400, "height": 400, "colorMode": "cmyk"}));
+    
+    // Add a spot swatch like Check_Text (K=1 alternate)
+    s.execute("swatch.new", &json!({
+        "name": "Check_Text",
+        "spot": true,
+        "color": {"c": 0.0, "m": 0.0, "y": 0.0, "k": 1.0}
+    })).unwrap();
+    
+    // Create many consecutive spot paths with overprint (like glyph shapes)
+    for i in 0..20 {
+        let x = 10.0 + (i as f64) * 15.0;
+        let id = run(&mut s, "shape.rectangle", json!({"x": x, "y": 50.0, "width": 10.0, "height": 20.0}))["id"].as_u64().unwrap();
+        run(&mut s, "paint.setFill", json!({"ids": [id], "swatch": "Check_Text"}));
+        run(&mut s, "paint.setStroke", json!({"ids": [id], "none": true}));
+        // Set overprint
+        s.execute("attributes.set", &json!({"ids": [id], "overprintFill": true})).unwrap();
+    }
+    
+    // Create transparent groups nearby (not overlapping the spot paths)
+    for i in 0..5 {
+        let x = 10.0 + (i as f64) * 60.0;
+        let id = run(&mut s, "shape.rectangle", json!({"x": x, "y": 150.0, "width": 50.0, "height": 50.0}))["id"].as_u64().unwrap();
+        run(&mut s, "paint.setFill", json!({"ids": [id], "color": {"c": 0.5, "m": 0.0, "y": 0.0, "k": 0.0}}));
+        run(&mut s, "paint.setStroke", json!({"ids": [id], "none": true}));
+        run(&mut s, "transparency.set", json!({"ids": [id], "opacity": 50}));
+    }
+    
+    // Create Multiply blending groups
+    for i in 0..3 {
+        let x = 10.0 + (i as f64) * 100.0;
+        let id = run(&mut s, "shape.rectangle", json!({"x": x, "y": 250.0, "width": 80.0, "height": 50.0}))["id"].as_u64().unwrap();
+        run(&mut s, "paint.setFill", json!({"ids": [id], "color": {"c": 0.0, "m": 0.5, "y": 0.0, "k": 0.0}}));
+        run(&mut s, "paint.setStroke", json!({"ids": [id], "none": true}));
+        run(&mut s, "transparency.set", json!({"ids": [id], "blend": "multiply"}));
+    }
+    
+    // Export as PDF/X-1a
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // The spot paths should be preserved as vector spot, not rasterized to DeviceCMYK.
+    // Check for the Check_Text colorant in the PDF.
+    let has_spot = text.contains("Check_Text") || text.contains("Check#5FText");
+    
+    assert!(has_spot, 
+        "Consecutive overprint spot paths should be preserved as vector spots, not rasterized to DeviceCMYK. PDF should contain Check_Text colorant.");
+}
+
+/// Test: PDF/X-1a export is deterministic (byte-identical on double export).
+/// This verifies that spot image stacking order is stable across exports.
+#[test]
+fn pdfx_1a_export_is_deterministic() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    
+    // Add multiple spots to test ordering
+    for name in ["SpotA", "SpotB", "SpotC", "SpotD"] {
+        s.execute("swatch.new", &json!({
+            "name": name,
+            "spot": true,
+            "color": {"c": 0.5, "m": 0.5, "y": 0.0, "k": 0.0}
+        })).unwrap();
+    }
+    
+    // Create shapes with different spots
+    for (i, name) in ["SpotA", "SpotB", "SpotC", "SpotD"].iter().enumerate() {
+        let x = 10.0 + (i as f64) * 20.0;
+        let id = run(&mut s, "shape.rectangle", json!({"x": x, "y": 10.0, "width": 15.0, "height": 80.0}))["id"].as_u64().unwrap();
+        run(&mut s, "paint.setFill", json!({"ids": [id], "swatch": name}));
+        run(&mut s, "paint.setStroke", json!({"ids": [id], "none": true}));
+    }
+    
+    // Create a semi-transparent overlay to trigger flattening
+    let overlay_id = run(&mut s, "shape.rectangle", json!({"x": 20.0, "y": 30.0, "width": 60.0, "height": 40.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overlay_id], "color": {"c": 0.2, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overlay_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [overlay_id], "opacity": 50}));
+    
+    // Export twice with balance 0 to force rasterization
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"balance": 0}
+    });
+    let v1 = s.execute("document.exportPdf", &p).unwrap();
+    let bytes1 = vectorcraft_format::base64_decode(v1["dataBase64"].as_str().unwrap()).unwrap();
+    
+    let v2 = s.execute("document.exportPdf", &p).unwrap();
+    let bytes2 = vectorcraft_format::base64_decode(v2["dataBase64"].as_str().unwrap()).unwrap();
+    
+    assert_eq!(bytes1, bytes2, "PDF/X-1a export should be byte-identical across runs (deterministic spot ordering)");
 }

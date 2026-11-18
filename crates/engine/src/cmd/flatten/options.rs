@@ -178,10 +178,12 @@ impl FlattenOptions {
         if self.keeps_colorize && solid && blob.is_some_and(|b| b.gray_source().is_some()) {
             return false;
         }
-        // For X-1a: keeps_spot_tint_images allows solid spot colorize with grayscale pixels
+        // For X-1a: keeps_spot_tint_images allows solid spot colorize with grayscale pixels.
+        // Also allows [Registration] which paints every plate.
         if self.keeps_spot_tint_images {
             if let Some(Paint::Solid { swatch: Some(name), .. }) = colorize {
-                if d.spot_names().contains(name) && blob.is_some_and(|b| b.gray_source().is_some()) {
+                let is_spot_or_registration = d.spot_names().contains(name) || name == vectorcraft_color::swatch::REGISTRATION;
+                if is_spot_or_registration && blob.is_some_and(|b| b.gray_source().is_some()) {
                     return false;
                 }
             }

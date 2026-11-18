@@ -428,9 +428,11 @@ impl Exporter<'_> {
             NodeKind::Text(t) => self.text(s, n, t, page),
             NodeKind::Image(im) => match (n.extras().colorize.as_deref(), self.doc.shown_image(n, im)) {
                 (Some(p @ Paint::Solid { swatch: Some(swatch_name), .. }), im)
-                    if self.no_soft_masks && self.doc.spot_names().contains(swatch_name) && self.doc.image_blob(&im).is_none_or(vectorcraft_doc::ImageBlob::takes_colorize) =>
+                    if self.no_soft_masks 
+                        && (self.doc.spot_names().contains(swatch_name) || swatch_name == vectorcraft_color::swatch::REGISTRATION)
+                        && self.doc.image_blob(&im).is_none_or(vectorcraft_doc::ImageBlob::takes_colorize) =>
                 {
-                    // X-1a/X-3: spot colorize as a Separation tint image (no soft mask).
+                    // X-1a/X-3: spot or [Registration] colorize as a tint image (no soft mask).
                     // Draw with overprint so tint 0 doesn't knock out to white.
                     let im = &*im;
                     if writable(s, im.xf, Rect::new(0.0, 0.0, im.width.max(1).into(), im.height.max(1).into())) {

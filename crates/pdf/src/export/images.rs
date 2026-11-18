@@ -170,16 +170,17 @@ impl Exporter<'_> {
     /// PDF/X-1a which forbids soft masks. `None` when the paint isn't a solid spot color, the
     /// image is missing, or its pixels can't be decoded.
     /// 
-    /// Special case: "All" is the registration colorant that paints every plate (CMYK + all spots).
-    /// It's written as a DeviceN with all process colorants plus all spot colorants.
+    /// Special case: [Registration] paints every plate (CMYK + all spots). It's written as a
+    /// DeviceN with all process colorants plus all spot colorants (colorant name "All").
     pub(super) fn spot_tint_image(&mut self, im: &vectorcraft_doc::ImageObject, paint: &Paint, interpolate: bool) -> Option<Image> {
         let Paint::Solid { color: _, swatch: Some(swatch_name), tint } = paint else { return None };
         
-        let is_all = swatch_name == "All";
+        // [Registration] paints every plate - written as /All in the PDF
+        let is_registration = swatch_name == vectorcraft_color::swatch::REGISTRATION;
         
-        // For regular spots, get the colorant name and alternate. For "All", we build a DeviceN
-        // with all colorants below.
-        if !is_all {
+        // For regular spots, verify the swatch exists as a spot. For [Registration], we build
+        // a DeviceN with all colorants below.
+        if !is_registration {
             self.spot_ink(swatch_name)?;
         }
         
@@ -206,10 +207,10 @@ impl Exporter<'_> {
         // Final tint at each pixel = coverage/255 * tint
         let tint_scaled: Vec<u8> = coverage.iter().map(|&c| (c as f32 * *tint).round() as u8).collect();
         
-        let device_n = if is_all {
-            // "All" is the registration colorant - paint every plate (CMYK + all spots).
+        let device_n = if is_registration {
+            // [Registration] paints every plate (CMYK + all spots).
             // Build a DeviceN with all process colorants plus all spot colorants in the document.
-            let spots: Vec<String> = doc.swatches_iter().filter(|w| w.spot && w.name != "All").map(|w| w.name.clone()).collect();
+            let spots: Vec<String> = doc.swatches_iter().filter(|w| w.spot).map(|w| w.name.clone()).collect();
             let spot_colorants = spots.iter().filter_map(|name| self.spot_ink(name))
                 .map(|(name, full)| Colorant::Spot { name, alternate: cmyk::Color::new_f32(full[0], full[1], full[2], full[3]) });
             DeviceNSpace::new(Process::ALL.into_iter().map(Colorant::Process).chain(spot_colorants))?

@@ -91,23 +91,31 @@ fn find_preservable_spot_indices(
     result
 }
 
-/// Collect all spot color names used in a node tree.
-/// Note: "All" is a special registration colorant that paints every plate - it's collected
-/// and handled specially by the PDF writer (rendered as DeviceN with all colorants).
+/// Collect all spot color names used in a node tree, in document swatch order for determinism.
+/// Includes [Registration] which paints every plate (not in doc.swatches but treated as a spot).
 fn collect_spot_names(doc: &Document, nodes: &[Node]) -> Vec<String> {
     let spot_swatches: HashSet<String> = doc.spot_names().into_iter().collect();
-    if spot_swatches.is_empty() {
-        return vec![];
-    }
     
     let mut found = HashSet::new();
     for n in nodes {
         collect_spots_in_node(&spot_swatches, n, &mut found);
     }
-    found.into_iter().collect()
+    
+    // Return in document swatch order for deterministic export, with [Registration] last if present.
+    // Registration is not in doc.swatches but we still need stable order.
+    let has_registration = found.remove(vectorcraft_color::swatch::REGISTRATION);
+    let mut result: Vec<String> = doc.swatches_iter()
+        .filter(|w| w.spot && found.contains(&w.name))
+        .map(|w| w.name.clone())
+        .collect();
+    if has_registration {
+        result.push(vectorcraft_color::swatch::REGISTRATION.to_string());
+    }
+    result
 }
 
 /// Recursively collect spot names from a node.
+/// Includes [Registration] which is not a swatch but needs its own plate.
 fn collect_spots_in_node(spot_swatches: &HashSet<String>, n: &Node, found: &mut HashSet<String>) {
     if !n.visible {
         return;
@@ -119,6 +127,13 @@ fn collect_spots_in_node(spot_swatches: &HashSet<String>, n: &Node, found: &mut 
         }
     }
     
+    // Also check colorize paint for images
+    if let Some(colorize) = &n.extras().colorize {
+        if let Some(name) = paint_spot_name(colorize, spot_swatches) {
+            found.insert(name);
+        }
+    }
+    
     if let Some(children) = n.children() {
         for child in children {
             collect_spots_in_node(spot_swatches, child, found);
@@ -126,14 +141,16 @@ fn collect_spots_in_node(spot_swatches: &HashSet<String>, n: &Node, found: &mut 
     }
 }
 
-/// Get the spot swatch name from a paint if it's linked to a spot.
+/// Get the spot swatch name from a paint if it's linked to a spot or [Registration].
 fn paint_spot_name(paint: &Paint, spot_swatches: &HashSet<String>) -> Option<String> {
     match paint {
+        // Registration is not in spot_swatches but paints every plate
+        p if p.is_registration() => Some(vectorcraft_color::swatch::REGISTRATION.to_string()),
         Paint::Solid { swatch: Some(name), .. } if spot_swatches.contains(name) => Some(name.clone()),
         Paint::Gradient(g) => {
             for stop in &g.gradient.stops {
                 if let Some(name) = &stop.swatch {
-                    if spot_swatches.contains(name) {
+                    if name == vectorcraft_color::swatch::REGISTRATION || spot_swatches.contains(name) {
                         return Some(name.clone());
                     }
                 }
@@ -173,6 +190,14 @@ fn recolor_node_for_spot(n: &Node, spot_name: &str) -> Node {
 
 fn recolor_paint_for_spot(paint: &Paint, spot_name: &str) -> Paint {
     match paint {
+        // Handle Registration specially: match by is_registration() rather than name comparison
+        p if spot_name == vectorcraft_color::swatch::REGISTRATION && p.is_registration() => {
+            if let Paint::Solid { tint, .. } = p {
+                Paint::Solid { color: Color::gray(*tint), swatch: None, tint: 1.0 }
+            } else {
+                Paint::None
+            }
+        }
         Paint::Solid { swatch: Some(name), tint, .. } if name == spot_name => {
             // Convert to grayscale where tint becomes the gray value (1.0 = black = full ink)
             Paint::Solid { color: Color::gray(*tint), swatch: None, tint: 1.0 }
@@ -232,17 +257,20 @@ fn strip_spots_node(n: &Node, spot_names: &HashSet<String>) -> Node {
 
 fn is_spot_paint(paint: &Paint, spot_names: &HashSet<String>) -> bool {
     match paint {
+        // Registration is always treated as a spot (paints every plate)
+        p if p.is_registration() => true,
         Paint::Solid { swatch: Some(name), .. } => spot_names.contains(name),
-        Paint::Gradient(g) => g.gradient.stops.iter().any(|s| s.swatch.as_ref().is_some_and(|n| spot_names.contains(n))),
+        Paint::Gradient(g) => g.gradient.stops.iter().any(|s| s.swatch.as_ref().is_some_and(|n| n == vectorcraft_color::swatch::REGISTRATION || spot_names.contains(n))),
         _ => false,
     }
 }
 
 fn strip_spot_paint(paint: &Paint, spot_names: &HashSet<String>) -> Paint {
     match paint {
+        // Registration paints every plate - strip it so it gets its own tint image
+        p if p.is_registration() => Paint::None,
         Paint::Solid { swatch: Some(name), .. } if spot_names.contains(name) => {
-            // All spots including "All" become transparent - they get their own tint images.
-            // "All" is handled specially in the PDF writer as a DeviceN with all colorants.
+            // All spots become transparent - they get their own tint images.
             Paint::None
         }
         Paint::Gradient(g) => {
@@ -250,8 +278,8 @@ fn strip_spot_paint(paint: &Paint, spot_names: &HashSet<String>) -> Paint {
             let mut all_spot = true;
             for stop in &mut g.gradient.stops {
                 if let Some(swatch) = &stop.swatch {
-                    if spot_names.contains(swatch) {
-                        // Spot stop becomes transparent
+                    if swatch == vectorcraft_color::swatch::REGISTRATION || spot_names.contains(swatch) {
+                        // Spot/registration stop becomes transparent
                         stop.opacity = 0.0;
                     } else {
                         all_spot = false;
@@ -313,8 +341,12 @@ fn render_spot_tint(
     Some(tint)
 }
 
-/// Get the CMYK alternate color at 100% tint for a spot swatch.
+/// Get the CMYK alternate color at 100% tint for a spot swatch or [Registration].
 fn spot_alternate(doc: &Document, spot_name: &str) -> [f32; 4] {
+    // [Registration] paints every plate at 100%
+    if spot_name == vectorcraft_color::swatch::REGISTRATION {
+        return [1.0, 1.0, 1.0, 1.0];
+    }
     for swatch in &doc.swatches {
         if swatch.spot && swatch.name == spot_name {
             if let Paint::Solid { color, .. } = &swatch.paint {
