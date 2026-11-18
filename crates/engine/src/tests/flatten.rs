@@ -864,41 +864,30 @@ fn spot_under_transparent_overlay_creates_spot_image() {
     run(&mut s, "transparency.set", json!({"ids": [overlay_id], "opacity": 50}));
     
     run(&mut s, "select.all", json!({}));
-    let before = picture(&s);
     
-    // Flatten with noTransparency and balance=0 to force rasterization.
-    let (ids, _vector, rasterized) = flatten(&mut s, json!({"noTransparency": true, "balance": 0}));
-    
-    // Should have created some output.
-    assert!(!ids.is_empty(), "should produce flattened output");
-    assert!(rasterized >= 1, "should rasterize the overlapping region (balance=0)");
-    
-    // The visual result should be close to the original.
-    assert!(changed(&before, &picture(&s)) < 0.1, "flattened result should look similar");
+    // Use flatten_document directly with proper no_transparency option.
+    // The JSON command doesn't expose no_transparency - it's set internally for PDF/X export.
+    let doc = &s.doc().unwrap().doc;
+    let mut options = crate::cmd::flatten::FlattenOptions::preset("low").unwrap();
+    options.no_transparency = Some(Default::default());
+    options.clip_complex_regions = true;
+    options.balance = 0.0;
+    let flat = crate::cmd::flatten::flatten_document(doc, &options).unwrap().unwrap();
     
     // Verify spot images are created by checking for colorized images.
-    // The flattened group should contain image nodes with colorize extras.
-    let doc = &s.doc().unwrap().doc;
     let mut total_images = 0;
     let mut colorized_images = 0;
-    for id in &ids {
-        if let Some(n) = doc.node(NodeId(*id)) {
-            n.walk(&mut |c| {
-                if let NodeKind::Image(_) = &c.kind {
-                    total_images += 1;
-                    if c.extras().colorize.is_some() {
-                        colorized_images += 1;
-                    }
-                }
-            });
+    flat.walk(|c| {
+        if let NodeKind::Image(_) = &c.kind {
+            total_images += 1;
+            if c.extras().colorize.is_some() {
+                colorized_images += 1;
+            }
         }
-    }
-    // For now, just verify that rasterization happened and we got images.
-    // The spot tint image creation depends on the spot being in an over-cap region.
+    });
+    // With no_transparency and clipComplexRegions, we should get spot tint images.
     assert!(total_images >= 1, "should have at least one image in flattened result, got {}", total_images);
-    // Note: colorized spot images are only created when render_raster creates them,
-    // which happens for CMYK documents with noTransparency and spots in the art.
-    // This test verifies the basic infrastructure is in place.
+    assert!(colorized_images >= 1, "should have colorized spot image(s), got {} colorized of {} total", colorized_images, total_images);
 }
 
 /// A spot with multiply blend and partial opacity over process colors creates a spot tint image.
@@ -921,28 +910,28 @@ fn spot_multiply_blend_creates_spot_image() {
     run(&mut s, "transparency.set", json!({"ids": [spot_id], "blendMode": "multiply", "opacity": 80}));
     
     run(&mut s, "select.all", json!({}));
-    let before = picture(&s);
     
-    // Use balance=0 to force rasterization.
-    let (ids, _vector, rasterized) = flatten(&mut s, json!({"noTransparency": true, "balance": 0}));
-    
-    assert!(!ids.is_empty());
-    assert!(rasterized >= 1, "should rasterize the overlapping transparent region (balance=0)");
-    assert!(changed(&before, &picture(&s)) < 0.1, "flattened should look similar");
-    
-    // Count total images in the output.
+    // Use flatten_document directly with proper no_transparency option.
     let doc = &s.doc().unwrap().doc;
+    let mut options = crate::cmd::flatten::FlattenOptions::preset("low").unwrap();
+    options.no_transparency = Some(Default::default());
+    options.clip_complex_regions = true;
+    options.balance = 0.0;
+    let flat = crate::cmd::flatten::flatten_document(doc, &options).unwrap().unwrap();
+    
+    // Count total images and colorized images in the output.
     let mut total_images = 0;
-    for id in &ids {
-        if let Some(n) = doc.node(NodeId(*id)) {
-            n.walk(&mut |c| {
-                if let NodeKind::Image(_) = &c.kind {
-                    total_images += 1;
-                }
-            });
+    let mut colorized_images = 0;
+    flat.walk(|c| {
+        if let NodeKind::Image(_) = &c.kind {
+            total_images += 1;
+            if c.extras().colorize.is_some() {
+                colorized_images += 1;
+            }
         }
-    }
+    });
     assert!(total_images >= 1, "should have at least one image in flattened result");
+    assert!(colorized_images >= 1, "should have colorized spot image(s), got {} colorized of {} total", colorized_images, total_images);
 }
 
 /// Two overlapping spots with opacity each get their own spot tint image.
@@ -976,30 +965,26 @@ fn two_spots_overlapping_with_opacity_create_separate_images() {
     run(&mut s, "transparency.set", json!({"ids": [blue_id], "opacity": 70}));
     
     run(&mut s, "select.all", json!({}));
-    let before = picture(&s);
+    let _before = picture(&s);
     
-    // Use balance=0 to force rasterization.
-    let (ids, _, rasterized) = flatten(&mut s, json!({"noTransparency": true, "balance": 0}));
-    
-    assert!(!ids.is_empty());
-    assert!(rasterized >= 1, "should rasterize for opacity blending (balance=0)");
-    assert!(changed(&before, &picture(&s)) < 0.1);
+    // Use flatten_document directly with proper no_transparency option.
+    let doc = &s.doc().unwrap().doc;
+    let mut options = crate::cmd::flatten::FlattenOptions::preset("low").unwrap();
+    options.no_transparency = Some(Default::default());
+    options.clip_complex_regions = true;
+    options.balance = 0.0;
+    let flat = crate::cmd::flatten::flatten_document(doc, &options).unwrap().unwrap();
     
     // Count colorized images - should have one for each spot ink used.
-    let doc = &s.doc().unwrap().doc;
     let mut spot_names = std::collections::HashSet::new();
-    for id in &ids {
-        if let Some(n) = doc.node(NodeId(*id)) {
-            n.walk(&mut |c| {
-                if let NodeKind::Image(_) = &c.kind {
-                    if let Some(paint) = c.extras().colorize.as_deref() {
-                        if let Paint::Solid { swatch: Some(name), .. } = paint {
-                            spot_names.insert(name.clone());
-                        }
-                    }
+    flat.walk(|c| {
+        if let NodeKind::Image(_) = &c.kind {
+            if let Some(paint) = c.extras().colorize.as_deref() {
+                if let Paint::Solid { swatch: Some(name), .. } = paint {
+                    spot_names.insert(name.clone());
                 }
-            });
+            }
         }
-    }
+    });
     assert!(spot_names.len() >= 2, "should have spot images for both inks: {:?}", spot_names);
 }
