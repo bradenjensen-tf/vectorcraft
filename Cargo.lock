@@ -7019,6 +7019,7 @@ dependencies = [
  "md-5",
  "objc2-core-foundation",
  "objc2-core-graphics",
+ "ruzstd",
  "serde",
  "serde_json",
  "sha2",
@@ -7030,9 +7031,11 @@ dependencies = [
  "vectorcraft-color",
  "vectorcraft-doc",
  "vectorcraft-effects",
+ "vectorcraft-format",
  "vectorcraft-geom 0.24.1",
  "vectorcraft-testkit",
  "vectorcraft-text",
+ "zstd",
 ]
 
 [[package]]

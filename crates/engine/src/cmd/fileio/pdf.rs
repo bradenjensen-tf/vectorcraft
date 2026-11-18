@@ -343,12 +343,20 @@ pub fn encode(cmd: &str, doc: &Document, p: &Value) -> Result<(Vec<u8>, Vec<Note
     encode_at(cmd, doc, p, None)
 }
 
+/// Precision (decimal places) for path geometry in the embedded native document: smaller files.
+/// Enough for sub-point accuracy at any scale VectorCraft supports.
+const EDITING_PRECISION: u8 = 4;
+
 /// [`encode`] modified at `modified` (Unix seconds) when given, instead of the time of writing.
 pub(super) fn encode_at(cmd: &str, doc: &Document, p: &Value, modified: Option<i64>) -> Result<(Vec<u8>, Vec<Note>)> {
     // Keep the editable object tree independent of preview fallbacks used by the drawn pages.
     let (full, placed) = crate::cmd::place::document::full_documents(doc);
     let mut notes: Vec<Note> = placed.into_iter().map(Note::loss).collect();
-    let (bytes, drawn) = encode_carrying_at(cmd, &full, p, modified, || Ok(vectorcraft_format::save(doc, false)), || Ok(None))?;
+    // Round path geometry for a smaller embedded file; compact, not pretty.
+    let native_opts = vectorcraft_format::SaveOptions { precision: Some(EDITING_PRECISION), ..Default::default() };
+    let (bytes, drawn) = encode_carrying_at(cmd, &full, p, modified, || {
+        vectorcraft_format::save_with(doc, &native_opts).map_err(|e| bad(cmd, e.to_string()))
+    }, || Ok(None))?;
     notes.extend(drawn);
     if notes.iter().any(|n| n.text.ends_with(SHOWN_SMALLER)) && options(cmd, &full, p)?.settings.standard == Standard::None {
         for n in notes.iter_mut().filter(|n| n.text.ends_with(SHOWN_SMALLER)) {
