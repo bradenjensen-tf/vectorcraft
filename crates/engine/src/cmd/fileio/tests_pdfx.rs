@@ -834,3 +834,49 @@ fn flattening_keeps_the_group_in_the_clipping_layer_when_the_layer_below_differs
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// A spot-colored rectangle under a 50% CMYK shape (inside an over-cap group) exports to PDF/X-1a
+/// with a Separation colorspace for the spot ink. The spot must not be baked into CMYK.
+#[test]
+fn pdfx_1a_preserves_spot_colors_in_flattened_transparency_as_separation() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    
+    // Add a spot swatch.
+    s.execute("swatch.new", &json!({
+        "name": "PantoneGold",
+        "spot": true,
+        "color": {"c": 0.0, "m": 0.2, "y": 0.8, "k": 0.1}
+    })).unwrap();
+    
+    // Create a spot-filled rectangle.
+    let spot_id = run(&mut s, "shape.rectangle", json!({"x": 20.0, "y": 20.0, "width": 80.0, "height": 80.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [spot_id], "swatch": "PantoneGold"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [spot_id], "none": true}));
+    
+    // Create a semi-transparent CMYK overlay above it.
+    let overlay_id = run(&mut s, "shape.rectangle", json!({"x": 40.0, "y": 40.0, "width": 80.0, "height": 80.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overlay_id], "color": {"c": 0.5, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overlay_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [overlay_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a (which requires flattening).
+    let p = json!({"standard": "pdfX1a", "compression": {"compressText": false}});
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // The PDF must contain a Separation or DeviceN colorspace for the spot ink.
+    // Look for /Separation or /DeviceN with the spot name.
+    let has_separation = text.contains("/Separation") || text.contains("/DeviceN");
+    let has_spot_name = text.contains("/PantoneGold") || text.contains("(PantoneGold)");
+    
+    assert!(has_separation && has_spot_name,
+        "PDF/X-1a with spot under transparency must have Separation/DeviceN with spot name: has_separation={}, has_spot_name={}",
+        has_separation, has_spot_name);
+    
+    // Verify it was flattened (should have a warning).
+    let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}

@@ -3,12 +3,21 @@
 //! `.ait` templates open from it untitled.
 
 use serde_json::{Value, json};
+use vectorcraft_doc::Document;
 
 use super::tests_svgedit::{comparable, rich};
 use super::*;
 
 fn b64(v: &Value) -> Vec<u8> {
     vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap_or_else(|| panic!("no dataBase64 in {v}"))).unwrap()
+}
+
+/// `d` without what opening a file sets anew, with geometry rounded to 4 decimals.
+/// AI native format rounds to 4 decimals, so comparing documents needs the same rounding.
+fn comparable_rounded(d: &Document) -> Document {
+    let mut d = comparable(d);
+    d.round_geometry(4);
+    d
 }
 
 fn open(s: &mut Session, name: &str, bytes: &[u8]) -> Value {
@@ -227,8 +236,8 @@ fn a_page_too_long_for_pdf_1_3_fails_before_the_flattening() {
 #[test]
 fn ait_templates_open_their_document_untitled() {
     let mut s = rich();
-    let before = &s.doc().unwrap().doc;
-    let (before_layers, before_symbols, before_patterns) = (before.layers.len(), before.symbols.len(), before.patterns.len());
+    // Round before to 4 decimals because AI native format rounds coordinates.
+    let before = comparable_rounded(&s.doc().unwrap().doc);
     // A never-saved document's .ai comes back as bytes.
     let ai = b64(&s.execute("document.save", &json!({"format": "ai"})).unwrap());
     assert!(ai.starts_with(b"%PDF"));
@@ -236,11 +245,9 @@ fn ait_templates_open_their_document_untitled() {
     assert_eq!((&r["format"], &r["restored"]), (&json!("ait"), &json!(true)), "{r}");
     assert!(r["title"].as_str().unwrap().starts_with("Untitled-"), "{r}");
     assert_eq!(s.doc().unwrap().path, None);
-    // Verify the document structure is preserved (layers, symbols, patterns).
-    // Exact coordinate comparison may fail due to 4-decimal rounding in AI native format.
-    let after = &s.doc().unwrap().doc;
-    assert_eq!((after.layers.len(), after.symbols.len(), after.patterns.len()), (before_layers, before_symbols, before_patterns),
-        "template round-trip preserves structure");
+    // Full document comparison with 4-decimal rounding (AI native format precision).
+    let after = comparable_rounded(&s.doc().unwrap().doc);
+    assert_eq!(after, before, "template round-trip preserves the document");
 }
 
 /// Save as Template writes a PDF-compatible `.ait` for a `.ait` path or `format: ait`, and New
@@ -251,9 +258,9 @@ fn save_as_template_writes_an_ait_that_new_from_template_opens_untitled() {
     let mut s = rich();
     s.execute("layer.new", &json!({"name": "Notes"})).unwrap();
     s.execute("shape.ellipse", &json!({"x": 20, "y": 120, "width": 40, "height": 30})).unwrap();
-    let before = &s.doc().unwrap().doc;
-    let (before_layers, before_symbols, before_patterns) = (before.layers.len(), before.symbols.len(), before.patterns.len());
-    assert_eq!(before_layers, 2);
+    // Round before to 4 decimals because AI native format rounds coordinates.
+    let before = comparable_rounded(&s.doc().unwrap().doc);
+    assert_eq!(before.layers.len(), 2);
     let path = tmp(&scratch, "brochure template.ait");
     let r = s.execute("file.saveAsTemplate", &json!({"path": path})).unwrap();
     assert_eq!(r["format"], "ait", "{r}");
@@ -264,11 +271,9 @@ fn save_as_template_writes_an_ait_that_new_from_template_opens_untitled() {
     assert_eq!(r["format"], "ait", "{r}");
     assert!(r["title"].as_str().unwrap().starts_with("Untitled-"), "{r}");
     assert_eq!(s.doc().unwrap().path, None);
-    // Verify the document structure is preserved (layers, symbols, patterns).
-    // Exact coordinate comparison may fail due to 4-decimal rounding in AI native format.
-    let after = &s.doc().unwrap().doc;
-    assert_eq!((after.layers.len(), after.symbols.len(), after.patterns.len()), (before_layers, before_symbols, before_patterns),
-        "template round-trip preserves structure");
+    // Full document comparison with 4-decimal rounding (AI native format precision).
+    let after = comparable_rounded(&s.doc().unwrap().doc);
+    assert_eq!(after, before, "template round-trip preserves the document");
     // Without a path: the bytes and a name for the Templates folder.
     let r = s.execute("file.saveAsTemplate", &json!({"format": "ait"})).unwrap();
     assert_eq!(r["format"], "ait", "{r}");
