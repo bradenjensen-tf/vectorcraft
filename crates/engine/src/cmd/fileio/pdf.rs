@@ -476,6 +476,12 @@ fn flatten_for(cmd: &str, doc: &Document, set: &PdfSettings, p: &Value) -> Resul
     // Keep spot tint images (grayscale image + solid spot paint) as-is: they are written as
     // /Separation tint images and shouldn't be re-flattened.
     o.keeps_spot_tint_images = true;
+    // Clamp over-cap raster rects to the union of all artboard bounds including bleed.
+    // This prevents rasters from extending far beyond the page (Vonco regression fix).
+    let page_bounds = doc.artboards.iter()
+        .map(|a| doc.setup.bleed_rect(a.rect))
+        .reduce(|a, b| a.union(b));
+    o.page_bounds = page_bounds;
     let mut flat = flatten_document(shown.as_ref().unwrap_or(doc), &o)?;
     // Safety net: flatten up to 3 more times if transparency remains (e.g. nested blend modes,
     // multi-clip-group structures the first pass didn't catch).

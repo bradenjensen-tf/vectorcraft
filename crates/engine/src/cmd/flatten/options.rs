@@ -2,7 +2,7 @@ use super::analysis::draws_image;
 use super::apply::{apply, plan};
 use super::presets::{FlattenerPreset, saved_preset};
 use super::report::target_roots;
-use super::{BTreeSet, Deserialize, Document, EngineError, Node, NodeKind, Paint, Result, Serialize, Session, Value, bad, json, str_param};
+use super::{BTreeSet, Deserialize, Document, EngineError, Node, NodeKind, Paint, Rect, Result, Serialize, Session, Value, bad, json, str_param};
 
 /// Object → Flatten Transparency settings: a preset's, adjusted by the command's params.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -42,6 +42,10 @@ pub struct FlattenOptions {
     /// they are written as /Separation tint images and shouldn't be re-flattened. Not a preset option.
     #[serde(skip)]
     pub keeps_spot_tint_images: bool,
+    /// Page bounds (including bleed) to clamp over-cap raster rects. `None` for no clamping.
+    /// Used to prevent rasters from extending far beyond the page. Not a preset option.
+    #[serde(skip)]
+    pub page_bounds: Option<Rect>,
 }
 
 impl Default for FlattenOptions {
@@ -91,6 +95,7 @@ impl FlattenOptions {
             no_transparency: None,
             keeps_colorize: false,
             keeps_spot_tint_images: false,
+            page_bounds: None,
         }
     }
 

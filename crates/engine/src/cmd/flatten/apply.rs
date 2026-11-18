@@ -449,9 +449,10 @@ pub(super) fn plan(src: &Document, roots: &[NodeId], o: &FlattenOptions, render:
             all
         };
         let ids: Vec<NodeId> = g.iter().map(|&i| roots[i]).collect();
+        let has_art_below = below > 0;
         let group = g.iter().any(|&i| see_through[i]).then(|| {
             let plain = shown(&plain);
-            flatten_group(&plain.iter().collect::<Vec<_>>(), o, cmyk)
+            flatten_group(&plain.iter().collect::<Vec<_>>(), o, cmyk, has_art_below)
         });
         let Some((regions, area)) = group.flatten() else {
             // Transparent art that its clip groups or clipping layers hide entirely draws nothing:
@@ -466,10 +467,11 @@ pub(super) fn plan(src: &Document, roots: &[NodeId], o: &FlattenOptions, render:
             continue;
         };
         
-        // For over-cap rasters (area.whole == true), try to preserve spot-colored objects at the
-        // top of the stacking order as vector. This keeps spot inks from being baked into CMYK.
+        // Try to preserve spot-colored objects at the top of the stacking order as vector.
+        // This keeps spot inks from being baked into CMYK. Works for both over-cap (a.whole)
+        // and normal rasterization.
         let (rasters, preserved_spots) = match area.as_ref().filter(|_| render) {
-            Some(a) if a.whole => {
+            Some(a) => {
                 // Find spot-only nodes at the top that can be preserved
                 // spot_indices contains indices into g (which are indices into roots/plain arrays)
                 let spot_indices = find_preservable_spot_indices(&baked, &g, &plain, &see_through);
@@ -515,10 +517,6 @@ pub(super) fn plan(src: &Document, roots: &[NodeId], o: &FlattenOptions, render:
                     
                     (rasters, preserved)
                 }
-            }
-            Some(a) => {
-                // Not over-cap, render as normal
-                (render_raster(&baked, &shown(&art), a.rect, a.ppi, a.clip.clone(), o)?, vec![])
             }
             None => (vec![], vec![]),
         };
@@ -793,8 +791,9 @@ fn inside_and_under(src: &Document, roots: &[NodeId], g: &[usize]) -> Option<(Ve
 }
 
 /// The regions and the image area replacing one group of overlapping objects (`plain`: the art as
-/// composited; `cmyk`: in a CMYK document); `None` when it paints nothing.
-fn flatten_group(plain: &[&Node], o: &FlattenOptions, cmyk: bool) -> Option<(Regions, Option<Area>)> {
+/// composited; `cmyk`: in a CMYK document; `has_art_below`: whether art from below is composited
+/// with this group—affects whether the rectangle fallback clip is safe); `None` when it paints nothing.
+fn flatten_group(plain: &[&Node], o: &FlattenOptions, cmyk: bool, has_art_below: bool) -> Option<(Regions, Option<Area>)> {
     let mut b = Builder { cmyk, ..Default::default() };
     let elems: Vec<Elem> = plain.iter().filter_map(|n| b.elem(n)).collect();
     if b.shapes.is_empty() {
@@ -852,6 +851,20 @@ fn flatten_group(plain: &[&Node], o: &FlattenOptions, cmyk: bool) -> Option<(Reg
         }
     }
     let raster_rect = if all { plain.iter().filter_map(|n| reach(n)).reduce(|a, b| a.union(b)) } else { bounds(&complex) };
+    // Clamp raster rect to page bounds if specified (prevents rasters extending far off page).
+    let raster_rect = raster_rect.map(|r| {
+        o.page_bounds.map_or(r, |page| {
+            let clamped = r.intersect(page);
+            if clamped.width() > 0.0 && clamped.height() > 0.0 {
+                clamped
+            } else {
+                // If the intersection is empty (art entirely outside page), use original bounds
+                // to avoid an invalid rect, but log a warning.
+                log::warn!("Raster rect {:?} doesn't intersect page {:?}, using unclamped", r, page);
+                r
+            }
+        })
+    });
     let area = raster_rect.map(|rect| {
         let clip = if all && o.no_transparency.is_some() && !o.preserve_alpha {
             // Over-cap rasters for no-transparency output need a clip (the group outline) so
@@ -865,23 +878,29 @@ fn flatten_group(plain: &[&Node], o: &FlattenOptions, cmyk: bool) -> Option<(Reg
             let refs: Vec<(&PathData, FillRule)> = b.shapes.iter().map(|s| (&s.path, s.rule)).collect();
             let union = po::unite_all(&refs);
             let clip_path = if union.is_empty() && !refs.is_empty() {
-                // Union failed; log and fall back to bounding box.
-                // Note: The bounding box is safe because the raster already covers the group's
-                // composite result, so an opaque rectangle clips nothing visible from this group.
-                // If there's art below this group in the stacking order, the rectangle doesn't
-                // affect it because the raster's alpha channel is what clips to the group shape.
-                log::warn!(
-                    "unite_all failed for {} paths, falling back to bounding rectangle",
-                    refs.len()
-                );
-                shapes::rectangle(rect)
+                // Union failed. The bounding box fallback is only safe when no art from below is
+                // composited: an opaque rectangle would clip that art incorrectly. When art lies
+                // below, skip the clip (the raster keeps its alpha shape from render_raster).
+                if has_art_below {
+                    log::warn!(
+                        "unite_all failed for {} paths with art below, skipping rectangle fallback",
+                        refs.len()
+                    );
+                    None
+                } else {
+                    log::warn!(
+                        "unite_all failed for {} paths, falling back to bounding rectangle",
+                        refs.len()
+                    );
+                    Some(shapes::rectangle(rect))
+                }
             } else if union.is_empty() {
                 // No shapes to unite (empty input)
-                shapes::rectangle(rect)
+                Some(shapes::rectangle(rect))
             } else {
-                union
+                Some(union)
             };
-            Some(clip_path)
+            clip_path
         } else {
             o.clip_complex_regions.then(|| PathData::new(complex.iter().flat_map(|&k| regions[k].path.subpaths.iter().cloned()).collect()))
         };

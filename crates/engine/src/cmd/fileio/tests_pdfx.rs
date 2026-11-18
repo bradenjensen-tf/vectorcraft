@@ -946,3 +946,109 @@ fn pdfx_1a_spot_under_transparency_over_cap_has_separation_image_within_page() {
     let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
     assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
 }
+
+/// End-to-end test: large area exceeding MAX_PIXELS triggers tiling during PDF export.
+/// The resulting PDF should have multiple images placed adjacently (tiles).
+#[test]
+fn pdfx_1a_large_area_uses_tiling_in_export() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    
+    // Create a large document (2500x2500 pt). At 300 ppi (scale ~4.17), this is 
+    // about 10400x10400 pixels = 108 million pixels, well over the 64M limit.
+    run(&mut s, "file.new", json!({"width": 2500, "height": 2500, "colorMode": "cmyk"}));
+    
+    // Create overlapping shapes that force flattening.
+    // A CMYK background.
+    let bg_id = run(&mut s, "shape.rectangle", json!({"x": 0.0, "y": 0.0, "width": 2500.0, "height": 2500.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [bg_id], "color": {"c": 0.1, "m": 0.1, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [bg_id], "none": true}));
+    
+    // A semi-transparent overlay to trigger flattening.
+    let overlay_id = run(&mut s, "shape.rectangle", json!({"x": 100.0, "y": 100.0, "width": 2300.0, "height": 2300.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overlay_id], "color": {"c": 0.0, "m": 0.5, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overlay_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [overlay_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a with 300 ppi to trigger tiling.
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"lineArtPpi": 300, "balance": 0}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // Count the number of image XObjects. With tiling, there should be multiple.
+    // Each /Image XObject has a /Subtype/Image declaration (no space in compressed output).
+    let image_count = text.matches("/Subtype/Image").count();
+    
+    // With a 2500x2500 pt area at 300 ppi:
+    // - Total: ~10400x10400 = 108M pixels (over 64M limit)
+    // - Tile size: sqrt(64M) ≈ 8000 pixels per side
+    // - Expected: at least 2x2 = 4 tiles (more likely with safety margins)
+    assert!(image_count >= 2,
+        "Large area should produce multiple image tiles, got {} images. PDF prefix: {}...",
+        image_count, &text[..text.len().min(2000)]);
+    
+    // Verify it was flattened.
+    let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}
+
+/// End-to-end test: raster rect clamped to page bounds with bleed.
+/// Art extending off the page shouldn't cause rasters to be placed far outside.
+#[test]
+fn pdfx_1a_raster_rect_clamped_to_page_bounds() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    
+    // Create a small page with bleed.
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    // Set bleed (12 pt = 1/6 inch on all sides).
+    s.execute("document.setup", &json!({"bleed": [12.0, 12.0, 12.0, 12.0]})).unwrap();
+    
+    // Create art that extends FAR off the page (e.g., at y = -5000).
+    // This simulates the Vonco regression where art was placed at y=-5730.
+    let far_id = run(&mut s, "shape.rectangle", json!({"x": 50.0, "y": -5000.0, "width": 100.0, "height": 200.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [far_id], "color": {"c": 0.5, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [far_id], "none": true}));
+    
+    // Add overlapping art on the page with transparency to trigger flattening.
+    let on_page_id = run(&mut s, "shape.rectangle", json!({"x": 50.0, "y": 50.0, "width": 100.0, "height": 100.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [on_page_id], "color": {"c": 0.0, "m": 0.5, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [on_page_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [on_page_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a.
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"balance": 0}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // Check that no image placement matrix has translations far outside page bounds.
+    // Page is 200x200 with 12pt bleed, so valid range is roughly -12 to 212.
+    // We allow some slack for rounding but definitely not -5000.
+    let page_max = 500.0; // generous limit to catch the -5000 case
+    for line in text.lines() {
+        if line.ends_with(" cm") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 6 {
+                // Matrix is [a b c d e f] where e and f are translation
+                if let (Ok(e), Ok(f)) = (parts[4].parse::<f64>(), parts[5].parse::<f64>()) {
+                    assert!(e.abs() < page_max && f.abs() < page_max,
+                        "Image placed far outside page at ({}, {}), should be clamped to page+bleed bounds", e, f);
+                }
+            }
+        }
+    }
+    
+    // Verify it was flattened.
+    let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}
