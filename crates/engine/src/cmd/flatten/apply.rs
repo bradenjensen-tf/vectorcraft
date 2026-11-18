@@ -92,6 +92,8 @@ fn find_preservable_spot_indices(
 }
 
 /// Collect all spot color names used in a node tree.
+/// Note: "All" is a special registration colorant that paints every plate - it's collected
+/// and handled specially by the PDF writer (rendered as DeviceN with all colorants).
 fn collect_spot_names(doc: &Document, nodes: &[Node]) -> Vec<String> {
     let spot_swatches: HashSet<String> = doc.spot_names().into_iter().collect();
     if spot_swatches.is_empty() {
@@ -239,16 +241,21 @@ fn is_spot_paint(paint: &Paint, spot_names: &HashSet<String>) -> bool {
 fn strip_spot_paint(paint: &Paint, spot_names: &HashSet<String>) -> Paint {
     match paint {
         Paint::Solid { swatch: Some(name), .. } if spot_names.contains(name) => {
-            // Spot color becomes transparent (no process ink)
+            // All spots including "All" become transparent - they get their own tint images.
+            // "All" is handled specially in the PDF writer as a DeviceN with all colorants.
             Paint::None
         }
         Paint::Gradient(g) => {
             let mut g = g.clone();
             let mut all_spot = true;
             for stop in &mut g.gradient.stops {
-                if stop.swatch.as_ref().is_some_and(|s| spot_names.contains(s)) {
-                    // Spot stop becomes transparent
-                    stop.opacity = 0.0;
+                if let Some(swatch) = &stop.swatch {
+                    if spot_names.contains(swatch) {
+                        // Spot stop becomes transparent
+                        stop.opacity = 0.0;
+                    } else {
+                        all_spot = false;
+                    }
                 } else {
                     all_spot = false;
                 }

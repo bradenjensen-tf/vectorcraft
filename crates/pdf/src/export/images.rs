@@ -165,14 +165,23 @@ impl Exporter<'_> {
     }
 
     /// Spot tint image for X-1a export: a grayscale image colorized with a spot paint, written
-    /// as a /Separation or /DeviceN image where pixel values are tint amounts (no soft mask).
+    /// as a /DeviceN image where pixel values are tint amounts (no soft mask).
     /// Unlike [`Self::colorized_image`], this doesn't use an alpha channel, making it valid for
     /// PDF/X-1a which forbids soft masks. `None` when the paint isn't a solid spot color, the
     /// image is missing, or its pixels can't be decoded.
+    /// 
+    /// Special case: "All" is the registration colorant that paints every plate (CMYK + all spots).
+    /// It's written as a DeviceN with all process colorants plus all spot colorants.
     pub(super) fn spot_tint_image(&mut self, im: &vectorcraft_doc::ImageObject, paint: &Paint, interpolate: bool) -> Option<Image> {
         let Paint::Solid { color: _, swatch: Some(swatch_name), tint } = paint else { return None };
-        // Only for spot colors
-        let (name, alternate) = self.spot_ink(swatch_name)?;
+        
+        let is_all = swatch_name == "All";
+        
+        // For regular spots, get the colorant name and alternate. For "All", we build a DeviceN
+        // with all colorants below.
+        if !is_all {
+            self.spot_ink(swatch_name)?;
+        }
         
         let size = self.image_size(im);
         let interpolate = interpolate && self.interpolate;
@@ -197,13 +206,31 @@ impl Exporter<'_> {
         // Final tint at each pixel = coverage/255 * tint
         let tint_scaled: Vec<u8> = coverage.iter().map(|&c| (c as f32 * *tint).round() as u8).collect();
         
-        // Create a DeviceN space with a single spot colorant.
-        // A DeviceN with one colorant is functionally equivalent to Separation
-        // and many PDF writers emit it that way.
-        let colorant = Colorant::Spot { name, alternate: cmyk::Color::new_f32(alternate[0], alternate[1], alternate[2], alternate[3]) };
-        let device_n = DeviceNSpace::new(std::iter::once(colorant))?;
+        let device_n = if is_all {
+            // "All" is the registration colorant - paint every plate (CMYK + all spots).
+            // Build a DeviceN with all process colorants plus all spot colorants in the document.
+            let spots: Vec<String> = doc.swatches_iter().filter(|w| w.spot && w.name != "All").map(|w| w.name.clone()).collect();
+            let spot_colorants = spots.iter().filter_map(|name| self.spot_ink(name))
+                .map(|(name, full)| Colorant::Spot { name, alternate: cmyk::Color::new_f32(full[0], full[1], full[2], full[3]) });
+            DeviceNSpace::new(Process::ALL.into_iter().map(Colorant::Process).chain(spot_colorants))?
+        } else {
+            // Regular spot: create a DeviceN with just this colorant.
+            let (name, alternate) = self.spot_ink(swatch_name)?;
+            let colorant = Colorant::Spot { name, alternate: cmyk::Color::new_f32(alternate[0], alternate[1], alternate[2], alternate[3]) };
+            DeviceNSpace::new(std::iter::once(colorant))?
+        };
         
-        let img = Image::from_custom(SpotTint { tint: Arc::new(tint_scaled), width, height, device_n }, interpolate).ok();
+        // For "All", we need multiple tint values (one per colorant). Each pixel has the same
+        // tint applied to all colorants.
+        let n_colorants = device_n.colorants().len();
+        let tint_data: Vec<u8> = if n_colorants == 1 {
+            tint_scaled
+        } else {
+            // Repeat the tint value for each colorant
+            tint_scaled.iter().flat_map(|&t| std::iter::repeat(t).take(n_colorants)).collect()
+        };
+        
+        let img = Image::from_custom(SpotTint { tint: Arc::new(tint_data), width, height, device_n }, interpolate).ok();
         self.images.insert(cache, img.clone());
         img
     }

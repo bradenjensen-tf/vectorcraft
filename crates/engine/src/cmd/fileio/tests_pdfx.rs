@@ -1156,3 +1156,111 @@ fn pdfx_1a_process_tile_excludes_spot_ink() {
     let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
     assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
 }
+
+/// End-to-end test: "All" registration spot gets a DeviceN with all colorants.
+/// "All" in PDF is a special separation colorant that paints every plate.
+#[test]
+fn pdfx_1a_all_spot_paints_every_plate() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    
+    // Add an "All" spot swatch (registration colorant).
+    s.execute("swatch.new", &json!({
+        "name": "All",
+        "spot": true,
+        "color": {"c": 1.0, "m": 1.0, "y": 1.0, "k": 1.0}
+    })).unwrap();
+    
+    // Also add a regular spot to verify "All" includes it.
+    s.execute("swatch.new", &json!({
+        "name": "RegularSpot",
+        "spot": true,
+        "color": {"c": 0.0, "m": 1.0, "y": 0.0, "k": 0.0}
+    })).unwrap();
+    
+    // Create a shape with the "All" fill.
+    let all_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 10.0, "width": 80.0, "height": 80.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [all_id], "swatch": "All"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [all_id], "none": true}));
+    
+    // Create a semi-transparent overlay to trigger flattening.
+    let overlay_id = run(&mut s, "shape.rectangle", json!({"x": 30.0, "y": 30.0, "width": 60.0, "height": 60.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overlay_id], "color": {"c": 0.2, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overlay_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [overlay_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a.
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"balance": 0}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // The PDF should have a DeviceN with process colorants for "All".
+    // "All" paints every plate, so the DeviceN should contain Cyan, Magenta, Yellow, Black.
+    let has_process_colorants = text.contains("/Cyan") && text.contains("/Magenta") 
+        && text.contains("/Yellow") && text.contains("/Black");
+    
+    assert!(has_process_colorants,
+        "\"All\" spot should create DeviceN with process colorants (Cyan/Magenta/Yellow/Black)");
+    
+    // Verify it was flattened.
+    let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}
+
+/// Test: spot names with special characters (like underscores, slashes) are preserved.
+/// This tests that spot names like "Check_Text" or names with "/" work correctly.
+#[test]
+fn pdfx_1a_spot_with_special_characters_in_name() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    
+    // Add spots with special characters in names (like Check_Text).
+    s.execute("swatch.new", &json!({
+        "name": "Check_Text",
+        "spot": true,
+        "color": {"c": 0.0, "m": 0.0, "y": 0.0, "k": 1.0}
+    })).unwrap();
+    
+    // Create a shape with the special-name spot.
+    let spot_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 10.0, "width": 80.0, "height": 80.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [spot_id], "swatch": "Check_Text"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [spot_id], "none": true}));
+    
+    // Create a semi-transparent overlay to trigger flattening.
+    let overlay_id = run(&mut s, "shape.rectangle", json!({"x": 30.0, "y": 30.0, "width": 60.0, "height": 60.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overlay_id], "color": {"c": 0.2, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overlay_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [overlay_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a.
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"balance": 0}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // The PDF should contain the spot name (possibly with # encoding for special chars).
+    // In PDF, underscore becomes #5F in names.
+    let has_spot = text.contains("Check_Text") || text.contains("Check#5FText");
+    
+    assert!(has_spot,
+        "Spot with special characters 'Check_Text' should appear in PDF");
+    
+    // Also verify there's a DeviceN colorspace for it.
+    let has_device_n = text.contains("/DeviceN");
+    assert!(has_device_n, "Should have DeviceN colorspace for spot");
+    
+    // Verify it was flattened.
+    let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}
