@@ -431,10 +431,14 @@ impl Exporter<'_> {
                     if self.no_soft_masks && self.doc.spot_names().contains(swatch_name) && self.doc.image_blob(&im).is_none_or(vectorcraft_doc::ImageBlob::takes_colorize) =>
                 {
                     // X-1a/X-3: spot colorize as a Separation tint image (no soft mask).
+                    // Draw with overprint so tint 0 doesn't knock out to white.
                     let im = &*im;
                     if writable(s, im.xf, Rect::new(0.0, 0.0, im.width.max(1).into(), im.height.max(1).into())) {
                         if let Some(spot_img) = self.spot_tint_image(im, p, !n.extras().pixelated) {
-                            self.image(s, im, Some(spot_img), n.extras().pixelated);
+                            self.overprinted = true;
+                            crate::forms::form(s, crate::forms::Mark::Overprint, |s| {
+                                self.image(s, im, Some(spot_img), n.extras().pixelated);
+                            });
                         } else {
                             self.image_left_out = self.image_left_out.map(|_| true);
                             self.warn(UNDECODED);

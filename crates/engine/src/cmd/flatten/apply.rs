@@ -199,6 +199,70 @@ fn recolor_paint_for_spot(paint: &Paint, spot_name: &str) -> Paint {
     }
 }
 
+/// Strip spot colors from art for process-only rendering.
+/// Spot-colored elements become transparent so they don't appear in the process tile.
+fn strip_spots_for_process(art: &[Node], doc: &Document) -> Vec<Node> {
+    let spot_names: HashSet<String> = doc.spot_names().into_iter().collect();
+    art.iter().map(|n| strip_spots_node(n, &spot_names)).collect()
+}
+
+fn strip_spots_node(n: &Node, spot_names: &HashSet<String>) -> Node {
+    let mut n = n.clone();
+    // Strip spot paints from appearance items
+    let mut app = (*n.appearance).clone();
+    for item in &mut app.items {
+        *item.paint_mut() = strip_spot_paint(item.paint(), spot_names);
+    }
+    n.appearance = vectorcraft_doc::Shared::new(app);
+    // Also strip colorize if it's a spot
+    if let Some(colorize) = &n.extras().colorize {
+        if is_spot_paint(colorize, spot_names) {
+            n.extras_mut().colorize = None;
+        }
+    }
+    if let Some(ch) = n.children_mut() {
+        for c in ch.iter_mut() {
+            *c = std::sync::Arc::new(strip_spots_node(c, spot_names));
+        }
+    }
+    n
+}
+
+fn is_spot_paint(paint: &Paint, spot_names: &HashSet<String>) -> bool {
+    match paint {
+        Paint::Solid { swatch: Some(name), .. } => spot_names.contains(name),
+        Paint::Gradient(g) => g.gradient.stops.iter().any(|s| s.swatch.as_ref().is_some_and(|n| spot_names.contains(n))),
+        _ => false,
+    }
+}
+
+fn strip_spot_paint(paint: &Paint, spot_names: &HashSet<String>) -> Paint {
+    match paint {
+        Paint::Solid { swatch: Some(name), .. } if spot_names.contains(name) => {
+            // Spot color becomes transparent (no process ink)
+            Paint::None
+        }
+        Paint::Gradient(g) => {
+            let mut g = g.clone();
+            let mut all_spot = true;
+            for stop in &mut g.gradient.stops {
+                if stop.swatch.as_ref().is_some_and(|s| spot_names.contains(s)) {
+                    // Spot stop becomes transparent
+                    stop.opacity = 0.0;
+                } else {
+                    all_spot = false;
+                }
+            }
+            if all_spot {
+                Paint::None
+            } else {
+                Paint::Gradient(g)
+            }
+        }
+        _ => paint.clone(),
+    }
+}
+
 /// Render a spot tint image for one spot color.
 /// Returns grayscale pixels where the value is the tint amount (0 = no ink, 255 = full ink).
 fn render_spot_tint(
@@ -1105,7 +1169,16 @@ fn render_single_tile(doc: &Document, art: &[Node], tile_rect: Rect, scale: f64,
     
     if no_alpha && doc.color_mode == ColorMode::Cmyk {
         let opts = vectorcraft_render::RenderOptions { background: Some([255; 4]), skip_templates: true, ..Default::default() };
-        let inks = r.render_region_inks(&tmp, tile_rect, scale, &opts);
+        
+        // Strip spot colors from art for the process tile. Spots get their own tint images.
+        let process_art = if spot_names.is_empty() {
+            art.to_vec()
+        } else {
+            strip_spots_for_process(art, doc)
+        };
+        let process_tmp = isolated_doc(doc, process_art);
+        
+        let inks = r.render_region_inks(&process_tmp, tile_rect, scale, &opts);
         vectorcraft_doc::cancel::check()?;
         let (width, height) = vectorcraft_render::region_pixels(tile_rect, scale);
         if let Some(blob) = Inks::new(width, height, inks).and_then(|i| ImageBlob::cmyk_tiff(&i)) {

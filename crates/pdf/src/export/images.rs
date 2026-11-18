@@ -53,7 +53,8 @@ impl CustomImage for Tinted {
 }
 
 /// A spot tint image for X-1a: variable tint per pixel, no alpha channel.
-/// The color channel holds tint values (0=no ink, 255=full ink) in a Separation/DeviceN colorspace.
+/// The color channel holds tint values (0=no ink, 255=full ink) in a /Separation colorspace.
+/// Uses DeviceN with a single colorant, which krilla will emit as /Separation.
 #[derive(Clone, Hash)]
 struct SpotTint {
     tint: Arc<Vec<u8>>,
@@ -196,7 +197,9 @@ impl Exporter<'_> {
         // Final tint at each pixel = coverage/255 * tint
         let tint_scaled: Vec<u8> = coverage.iter().map(|&c| (c as f32 * *tint).round() as u8).collect();
         
-        // Create a DeviceN space with just this spot colorant
+        // Create a DeviceN space with a single spot colorant.
+        // A DeviceN with one colorant is functionally equivalent to Separation
+        // and many PDF writers emit it that way.
         let colorant = Colorant::Spot { name, alternate: cmyk::Color::new_f32(alternate[0], alternate[1], alternate[2], alternate[3]) };
         let device_n = DeviceNSpace::new(std::iter::once(colorant))?;
         

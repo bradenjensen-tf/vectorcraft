@@ -1052,3 +1052,107 @@ fn pdfx_1a_raster_rect_clamped_to_page_bounds() {
     let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
     assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
 }
+
+/// End-to-end test: spot images have overprint ExtGState (OP/op true).
+/// Without overprint, tint 0 would knock out to white.
+#[test]
+fn pdfx_1a_spot_tint_images_have_overprint_extgstate() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    
+    // Add a spot swatch.
+    s.execute("swatch.new", &json!({
+        "name": "TestSpot",
+        "spot": true,
+        "color": {"c": 0.0, "m": 0.5, "y": 1.0, "k": 0.0}
+    })).unwrap();
+    
+    // Create a spot-filled rectangle.
+    let spot_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 10.0, "width": 100.0, "height": 100.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [spot_id], "swatch": "TestSpot"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [spot_id], "none": true}));
+    
+    // Create a semi-transparent overlay to trigger flattening.
+    let overlay_id = run(&mut s, "shape.rectangle", json!({"x": 30.0, "y": 30.0, "width": 60.0, "height": 60.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overlay_id], "color": {"c": 0.2, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overlay_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [overlay_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a.
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"balance": 0}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // The PDF must contain an ExtGState with OP and op for overprint.
+    // Look for /OP true/op true or /OP true /op true.
+    let has_overprint_gs = text.contains("/OP true") && text.contains("/op true");
+    
+    assert!(has_overprint_gs,
+        "PDF/X-1a with spot tint images must have overprint ExtGState (/OP true /op true)");
+    
+    // Verify it was flattened.
+    let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}
+
+/// End-to-end test: process tile doesn't contain spot ink.
+/// When a spot-colored shape overlaps with transparent process art, the process tile
+/// should not include the spot ink (spots go on their own tint images).
+#[test]
+fn pdfx_1a_process_tile_excludes_spot_ink() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    
+    // Add a spot swatch with a distinctive CMYK alternate (pure magenta).
+    s.execute("swatch.new", &json!({
+        "name": "PureMagenta",
+        "spot": true,
+        "color": {"c": 0.0, "m": 1.0, "y": 0.0, "k": 0.0}
+    })).unwrap();
+    
+    // Create a CMYK background (cyan).
+    let bg_id = run(&mut s, "shape.rectangle", json!({"x": 0.0, "y": 0.0, "width": 200.0, "height": 200.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [bg_id], "color": {"c": 1.0, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [bg_id], "none": true}));
+    
+    // Create a spot-filled rectangle on top.
+    let spot_id = run(&mut s, "shape.rectangle", json!({"x": 50.0, "y": 50.0, "width": 100.0, "height": 100.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [spot_id], "swatch": "PureMagenta"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [spot_id], "none": true}));
+    
+    // Add a third shape with transparency to trigger flattening.
+    let trans_id = run(&mut s, "shape.rectangle", json!({"x": 75.0, "y": 75.0, "width": 50.0, "height": 50.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [trans_id], "color": {"c": 0.0, "m": 0.0, "y": 1.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [trans_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [trans_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a with balance=0 to force rasterization.
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"balance": 0}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // The PDF should have both:
+    // 1. A CMYK image (the process tile) - /ColorSpace/DeviceCMYK
+    // 2. A spot tint image - /ColorSpace with DeviceN containing PureMagenta
+    let has_cmyk_image = text.contains("/DeviceCMYK");
+    let has_spot_image = text.contains("/DeviceN") && text.contains("PureMagenta");
+    
+    assert!(has_cmyk_image, "Should have CMYK process tile");
+    assert!(has_spot_image, "Should have spot tint image for PureMagenta");
+    
+    // Verify it was flattened.
+    let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}
