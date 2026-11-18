@@ -74,6 +74,8 @@ pub(crate) struct Exporter<'a> {
     /// Conic gradients may be written as sweep shadings, whose PostScript calculator functions
     /// PDF/A forbids; otherwise they are drawn as images ([`Self::area_paint`]).
     sweeps: bool,
+    /// PDF/X-1a or PDF/X-3 export: no soft masks allowed, spot images use direct tint values.
+    no_soft_masks: bool,
     /// Images may have 16 bits a sample (PDF 1.5 and later); in earlier files they are written at
     /// 8 bits ([`embed`]).
     sixteen_bit: bool,

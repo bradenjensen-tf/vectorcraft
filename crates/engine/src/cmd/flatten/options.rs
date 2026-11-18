@@ -38,6 +38,10 @@ pub struct FlattenOptions {
     /// itself doesn't count as transparency. Not a preset option.
     #[serde(skip)]
     pub keeps_colorize: bool,
+    /// Keep spot tint images (grayscale image + solid spot paint) as-is for X-1a export:
+    /// they are written as /Separation tint images and shouldn't be re-flattened. Not a preset option.
+    #[serde(skip)]
+    pub keeps_spot_tint_images: bool,
 }
 
 impl Default for FlattenOptions {
@@ -86,6 +90,7 @@ impl FlattenOptions {
             preserve_overprints: true,
             no_transparency: None,
             keeps_colorize: false,
+            keeps_spot_tint_images: false,
         }
     }
 
@@ -151,8 +156,10 @@ impl FlattenOptions {
 
     /// Whether colorized image `n`, art of `d`, counts as transparency by itself. With
     /// [`Self::keeps_colorize`], an image colorized with a solid paint whose pixels are grayscale
-    /// or 1-bit doesn't: the EPS writer draws it in that paint. An image whose pixels don't take
-    /// the paint ([`vectorcraft_doc::ImageBlob::takes_colorize`]) never counts: it draws uncolorized.
+    /// or 1-bit doesn't: the EPS writer draws it in that paint. With [`Self::keeps_spot_tint_images`],
+    /// a grayscale image colorized with a solid spot paint doesn't count: it's written as a
+    /// /Separation tint image. An image whose pixels don't take the paint
+    /// ([`vectorcraft_doc::ImageBlob::takes_colorize`]) never counts: it draws uncolorized.
     pub(crate) fn counts_colorize(&self, d: &Document, n: &Node) -> bool {
         let NodeKind::Image(im) = &n.kind else { return true };
         let shown = d.shown_image(n, im);
@@ -160,8 +167,21 @@ impl FlattenOptions {
         if blob.is_some_and(|b| !b.takes_colorize()) {
             return false;
         }
-        let solid = matches!(n.extras().colorize.as_deref(), Some(Paint::Solid { .. }));
-        !self.keeps_colorize || !solid || blob.is_some_and(|b| b.gray_source().is_none())
+        let colorize = n.extras().colorize.as_deref();
+        let solid = matches!(colorize, Some(Paint::Solid { .. }));
+        // For EPS: keeps_colorize allows any solid colorize with grayscale pixels
+        if self.keeps_colorize && solid && blob.is_some_and(|b| b.gray_source().is_some()) {
+            return false;
+        }
+        // For X-1a: keeps_spot_tint_images allows solid spot colorize with grayscale pixels
+        if self.keeps_spot_tint_images {
+            if let Some(Paint::Solid { swatch: Some(name), .. }) = colorize {
+                if d.spot_names().contains(name) && blob.is_some_and(|b| b.gray_source().is_some()) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// `n` shows an image whose see-through pixels count as transparency.

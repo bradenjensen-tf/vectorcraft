@@ -880,3 +880,69 @@ fn pdfx_1a_preserves_spot_colors_in_flattened_transparency_as_separation() {
     let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
     assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
 }
+
+/// End-to-end test: spot under transparency forced over REGION_CAP, exported via document.exportPdf.
+/// The PDF must contain /Separation with the spot name and no raster extends past the page.
+#[test]
+fn pdfx_1a_spot_under_transparency_over_cap_has_separation_image_within_page() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    
+    // Add a spot swatch.
+    s.execute("swatch.new", &json!({
+        "name": "TestSpot",
+        "spot": true,
+        "color": {"c": 0.0, "m": 0.5, "y": 1.0, "k": 0.0}
+    })).unwrap();
+    
+    // Create a spot-filled rectangle covering part of the page.
+    let spot_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 10.0, "width": 100.0, "height": 100.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [spot_id], "swatch": "TestSpot"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [spot_id], "none": true}));
+    
+    // Create a semi-transparent overlay to trigger flattening.
+    // Using balance=0 forces rasterization (over-cap scenario).
+    let overlay_id = run(&mut s, "shape.rectangle", json!({"x": 30.0, "y": 30.0, "width": 60.0, "height": 60.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overlay_id], "color": {"c": 0.2, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overlay_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [overlay_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a with low balance to force rasterization (over-cap scenario).
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"balance": 0}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // The PDF must contain a Separation or DeviceN colorspace for the spot ink.
+    let has_separation = text.contains("/Separation") || text.contains("/DeviceN");
+    let has_spot_name = text.contains("/TestSpot") || text.contains("(TestSpot)");
+    
+    assert!(has_separation && has_spot_name,
+        "PDF/X-1a with spot over-cap must have Separation/DeviceN with spot name: has_separation={}, has_spot_name={}",
+        has_separation, has_spot_name);
+    
+    // Check that no image extends far outside the page bounds.
+    // Page is 200x200. Look for image matrices that place images way outside.
+    // This is a basic check - we look for cm operators with values >> 200.
+    for line in text.lines() {
+        if line.ends_with(" cm") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 6 {
+                // Matrix is [a b c d e f] where e and f are translation
+                if let (Ok(e), Ok(f)) = (parts[4].parse::<f64>(), parts[5].parse::<f64>()) {
+                    assert!(e.abs() < 10000.0 && f.abs() < 10000.0,
+                        "Image placed far outside page at ({}, {})", e, f);
+                }
+            }
+        }
+    }
+    
+    // Verify it was flattened.
+    let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}

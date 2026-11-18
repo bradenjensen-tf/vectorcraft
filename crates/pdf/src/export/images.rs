@@ -52,6 +52,46 @@ impl CustomImage for Tinted {
     }
 }
 
+/// A spot tint image for X-1a: variable tint per pixel, no alpha channel.
+/// The color channel holds tint values (0=no ink, 255=full ink) in a Separation/DeviceN colorspace.
+#[derive(Clone, Hash)]
+struct SpotTint {
+    tint: Arc<Vec<u8>>,
+    width: u32,
+    height: u32,
+    device_n: DeviceNSpace,
+}
+
+impl CustomImage for SpotTint {
+    fn color_channel(&self) -> &[u8] {
+        &self.tint
+    }
+
+    fn alpha_channel(&self) -> Option<&[u8]> {
+        None
+    }
+
+    fn bits_per_component(&self) -> BitsPerComponent {
+        BitsPerComponent::Eight
+    }
+
+    fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    fn icc_profile(&self) -> Option<&[u8]> {
+        None
+    }
+
+    fn color_space(&self) -> ImageColorspace {
+        ImageColorspace::DeviceN
+    }
+
+    fn device_n_space(&self) -> Option<DeviceNSpace> {
+        Some(self.device_n.clone())
+    }
+}
+
 impl Exporter<'_> {
     /// Image `im` colorized with `paint` ([`vectorcraft_doc::NodeExtras::colorize`]): every pixel
     /// in the paint's color, with the image's coverage ([`vectorcraft_doc::ImageBlob::coverage`])
@@ -122,6 +162,49 @@ impl Exporter<'_> {
         self.images.insert(cache, img.clone());
         img
     }
+
+    /// Spot tint image for X-1a export: a grayscale image colorized with a spot paint, written
+    /// as a /Separation or /DeviceN image where pixel values are tint amounts (no soft mask).
+    /// Unlike [`Self::colorized_image`], this doesn't use an alpha channel, making it valid for
+    /// PDF/X-1a which forbids soft masks. `None` when the paint isn't a solid spot color, the
+    /// image is missing, or its pixels can't be decoded.
+    pub(super) fn spot_tint_image(&mut self, im: &vectorcraft_doc::ImageObject, paint: &Paint, interpolate: bool) -> Option<Image> {
+        let Paint::Solid { color: _, swatch: Some(swatch_name), tint } = paint else { return None };
+        // Only for spot colors
+        let (name, alternate) = self.spot_ink(swatch_name)?;
+        
+        let size = self.image_size(im);
+        let interpolate = interpolate && self.interpolate;
+        let cache = format!("{}\u{0}spot_tint_{}", im.key, swatch_name);
+        
+        if let Some(i) = self.images.get(&cache) {
+            return i.clone();
+        }
+        
+        let doc = self.doc;
+        let Some((width, height, coverage)) = doc
+            .image_blob(im)
+            .filter(|_| !self.left_out.contains(&im.key))
+            .and_then(|b| b.coverage())
+            .and_then(|(w, h, cover)| crate::images::coverage_sized(w, h, cover, size, self.compression))
+        else {
+            self.images.insert(cache, None);
+            return None;
+        };
+        
+        // Scale coverage by tint: coverage is 0-255, tint is 0-1
+        // Final tint at each pixel = coverage/255 * tint
+        let tint_scaled: Vec<u8> = coverage.iter().map(|&c| (c as f32 * *tint).round() as u8).collect();
+        
+        // Create a DeviceN space with just this spot colorant
+        let colorant = Colorant::Spot { name, alternate: cmyk::Color::new_f32(alternate[0], alternate[1], alternate[2], alternate[3]) };
+        let device_n = DeviceNSpace::new(std::iter::once(colorant))?;
+        
+        let img = Image::from_custom(SpotTint { tint: Arc::new(tint_scaled), width, height, device_n }, interpolate).ok();
+        self.images.insert(cache, img.clone());
+        img
+    }
+
     /// Image `im` placed `size` points wide and high, resampled and compressed as the Compression
     /// settings say ([`crate::images::recode`], [`crate::images::recode_cmyk`] for CMYK images);
     /// cached by key (and size when images are resampled). With `interpolate` (and the export's

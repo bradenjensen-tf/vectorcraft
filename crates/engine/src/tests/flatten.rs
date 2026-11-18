@@ -355,6 +355,7 @@ fn a_long_rasterized_area_is_placed_whole() {
     let _settings = settings_lock();
     let mut s = session();
     // 5569 pt long: more than the renderer's 32,768 pixels a side at the 64 Mpx limit's scale.
+    // Tiling produces multiple images that together cover the region at full ppi.
     let g = rect(&mut s, 10.0, 10.0, 100.0, 5569.0, "#000000");
     run(
         &mut s,
@@ -363,16 +364,22 @@ fn a_long_rasterized_area_is_placed_whole() {
     );
     run(&mut s, "transparency.set", json!({"ids": [g], "opacity": 40}));
     let (ids, _, rasterized) = flatten(&mut s, json!({"ids": [g], "lineArtPpi": 1200, "gradientPpi": 1200}));
-    assert_eq!(rasterized, 1);
+    assert!(rasterized >= 1, "at least one image tile");
     let mut placed = vec![];
     node(&s, ids[0]).walk(&mut |c| {
         if let NodeKind::Image(im) = &c.kind {
             placed.push((im.height, im.xf.transform_rect_bbox(Rect::new(0.0, 0.0, f64::from(im.width), f64::from(im.height)))));
         }
     });
-    let [(height, b)] = placed[..] else { panic!("one image: {placed:?}") };
-    assert!(height <= vectorcraft_render::MAX_RASTER_SIDE, "{height} pixels");
-    assert!(b.y0 <= 10.0 && b.y1 >= 5579.0, "the image covers the strip: {b:?}");
+    assert!(!placed.is_empty(), "has image tiles: {placed:?}");
+    // Each tile must stay within renderer limits
+    for (height, _) in &placed {
+        assert!(*height <= vectorcraft_render::MAX_RASTER_SIDE, "{height} pixels");
+    }
+    // Tiles together cover the whole strip (union of all tile bounds)
+    let min_y = placed.iter().map(|(_, b)| b.y0).fold(f64::INFINITY, f64::min);
+    let max_y = placed.iter().map(|(_, b)| b.y1).fold(f64::NEG_INFINITY, f64::max);
+    assert!(min_y <= 10.0 && max_y >= 5579.0, "the tiles cover the strip: y0={min_y}, y1={max_y}");
 }
 
 #[test]

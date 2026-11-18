@@ -288,7 +288,8 @@ pub(super) struct Flat {
     pub(super) regions: Regions,
     /// Where its image goes, and the image (once rendered).
     pub(super) area: Option<Area>,
-    raster: Option<Raster>,
+    /// The rendered raster images (may be multiple tiles for large regions).
+    rasters: Vec<Raster>,
     /// When the group is one block of type over several lines: its lines, to group the regions by.
     lines: Option<Lines>,
     /// Spot-colored objects that were preserved as vector (not rasterized). These go on top of
@@ -459,7 +460,7 @@ pub(super) fn plan(src: &Document, roots: &[NodeId], o: &FlattenOptions, render:
             let (hidden, left): (Vec<usize>, Vec<usize>) = g.iter().partition(|&&i| hides(i));
             if !hidden.is_empty() {
                 let roots = hidden.iter().map(|&i| roots[i]).collect();
-                out.flat.push(Flat { roots, regions: vec![], area: None, raster: None, lines: None, preserved_spots: vec![] });
+                out.flat.push(Flat { roots, regions: vec![], area: None, rasters: vec![], lines: None, preserved_spots: vec![] });
             }
             out.kept.extend(left.iter().map(|&i| roots[i]));
             continue;
@@ -467,7 +468,7 @@ pub(super) fn plan(src: &Document, roots: &[NodeId], o: &FlattenOptions, render:
         
         // For over-cap rasters (area.whole == true), try to preserve spot-colored objects at the
         // top of the stacking order as vector. This keeps spot inks from being baked into CMYK.
-        let (raster, preserved_spots) = match area.as_ref().filter(|_| render) {
+        let (rasters, preserved_spots) = match area.as_ref().filter(|_| render) {
             Some(a) if a.whole => {
                 // Find spot-only nodes at the top that can be preserved
                 // spot_indices contains indices into g (which are indices into roots/plain arrays)
@@ -475,7 +476,7 @@ pub(super) fn plan(src: &Document, roots: &[NodeId], o: &FlattenOptions, render:
                 
                 if spot_indices.is_empty() {
                     // No spots to preserve, render everything
-                    (Some(render_raster(&baked, &shown(&art), a.rect, a.ppi, a.clip.clone(), o)?), vec![])
+                    (render_raster(&baked, &shown(&art), a.rect, a.ppi, a.clip.clone(), o)?, vec![])
                 } else {
                     // Create a set of indices into g that should be excluded
                     let spot_g_positions: HashSet<usize> = spot_indices.iter()
@@ -500,10 +501,10 @@ pub(super) fn plan(src: &Document, roots: &[NodeId], o: &FlattenOptions, render:
                         .map(|(_, n)| n)
                         .collect();
                     
-                    let raster = if raster_art.is_empty() {
-                        None
+                    let rasters = if raster_art.is_empty() {
+                        vec![]
                     } else {
-                        Some(render_raster(&baked, &raster_art, a.rect, a.ppi, a.clip.clone(), o)?)
+                        render_raster(&baked, &raster_art, a.rect, a.ppi, a.clip.clone(), o)?
                     };
                     
                     // Collect the preserved spots with their original nodes
@@ -512,21 +513,21 @@ pub(super) fn plan(src: &Document, roots: &[NodeId], o: &FlattenOptions, render:
                         .map(|&i| (roots[i], plain[i].clone()))
                         .collect();
                     
-                    (raster, preserved)
+                    (rasters, preserved)
                 }
             }
             Some(a) => {
                 // Not over-cap, render as normal
-                (Some(render_raster(&baked, &shown(&art), a.rect, a.ppi, a.clip.clone(), o)?), vec![])
+                (render_raster(&baked, &shown(&art), a.rect, a.ppi, a.clip.clone(), o)?, vec![])
             }
-            None => (None, vec![]),
+            None => (vec![], vec![]),
         };
         
         let lines = match g.as_slice() {
             [i] => Lines::of(&art[*i]),
             _ => None,
         };
-        out.flat.push(Flat { roots: ids, regions, area, raster, lines, preserved_spots });
+        out.flat.push(Flat { roots: ids, regions, area, rasters, lines, preserved_spots });
     }
     out.work = out.kept.iter().map(|id| Kept::of(src, *id, o)).collect();
     Ok(out)
@@ -981,26 +982,102 @@ fn region_fill(elems: &[Elem], sources: &[usize], o: &FlattenOptions, cmyk: bool
 }
 
 /// `art` rendered over `rect` at `ppi`: over white with the white the art doesn't cover taken out
-/// again, or over nothing with Preserve Alpha. The image and
-/// its `clip` reach a pixel further. An opaque image in a CMYK document holds the art's ink
-/// amounts (a CMYK TIFF), so its CMYK colours keep their numbers (#2160); other images are PNGs.
-/// Fails when the image can't be encoded.
-fn render_raster(doc: &Document, art: &[Node], rect: Rect, ppi: f64, clip: Option<PathData>, o: &FlattenOptions) -> Result<Raster> {
-    let scale = raster_scale(rect, ppi);
+/// again, or over nothing with Preserve Alpha. The images and their `clip`s reach a pixel further.
+/// When the region is too large for a single image, it is split into pixel-aligned tiles.
+/// An opaque image in a CMYK document holds the art's ink amounts (a CMYK TIFF), so its CMYK
+/// colours keep their numbers (#2160); other images are PNGs. Fails when an image can't be encoded.
+fn render_raster(doc: &Document, art: &[Node], rect: Rect, ppi: f64, clip: Option<PathData>, o: &FlattenOptions) -> Result<Vec<Raster>> {
+    let scale = ppi / 72.0;
+    let tiles = compute_tiles(rect, scale);
+    
+    let mut rasters = vec![];
+    for tile_rect in tiles {
+        let tile = render_single_tile(doc, art, tile_rect, scale, &clip, o)?;
+        rasters.push(tile);
+    }
+    
+    if rasters.len() > 1 {
+        log::info!(
+            "Rendered {:.0}×{:.0} pt area at {:.0} ppi as {} tiles to preserve resolution",
+            rect.width(), rect.height(), ppi, rasters.len()
+        );
+    }
+    
+    Ok(rasters)
+}
+
+/// Compute pixel-aligned tile rectangles for a region at a given scale.
+/// If the region fits within limits, returns a single tile.
+/// Otherwise splits into tiles that each fit within MAX_PIXELS and MAX_RASTER_SIDE.
+fn compute_tiles(rect: Rect, scale: f64) -> Vec<Rect> {
     let px = 1.0 / scale;
     let rect = rect.inflate(px, px);
-    let clip = clip.map(|c| Some(po::offset_path(&c, px, po::Join::Miter, 4.0)).filter(|g| !g.is_empty()).unwrap_or(c));
-    let region = Rect::new(
-        rect.x0,
-        rect.y0,
-        rect.x0 + (rect.width() * scale).ceil().max(1.0) / scale,
-        rect.y0 + (rect.height() * scale).ceil().max(1.0) / scale,
-    );
-    let xf = Affine::translate(region.origin().to_vec2()) * Affine::scale(1.0 / scale);
+    
+    let total_width_px = (rect.width() * scale).ceil() as u64;
+    let total_height_px = (rect.height() * scale).ceil() as u64;
+    
+    let max_side = u64::from(vectorcraft_render::MAX_RASTER_SIDE) - 4;
+    let max_pixels = MAX_PIXELS as u64;
+    
+    let fits_single = total_width_px <= max_side 
+        && total_height_px <= max_side 
+        && total_width_px * total_height_px <= max_pixels;
+    
+    if fits_single {
+        let region = Rect::new(
+            rect.x0,
+            rect.y0,
+            rect.x0 + (rect.width() * scale).ceil().max(1.0) / scale,
+            rect.y0 + (rect.height() * scale).ceil().max(1.0) / scale,
+        );
+        return vec![region];
+    }
+    
+    let tile_side = tile_size_for_budget(max_pixels, max_side);
+    let tile_pts = tile_side as f64 / scale;
+    
+    let cols = ((rect.width() / tile_pts).ceil() as usize).max(1);
+    let rows = ((rect.height() / tile_pts).ceil() as usize).max(1);
+    
+    let mut tiles = vec![];
+    for row in 0..rows {
+        for col in 0..cols {
+            let x0 = rect.x0 + col as f64 * tile_pts;
+            let y0 = rect.y0 + row as f64 * tile_pts;
+            let x1 = (x0 + tile_pts).min(rect.x1);
+            let y1 = (y0 + tile_pts).min(rect.y1);
+            
+            let tile_rect = Rect::new(
+                x0,
+                y0,
+                x0 + ((x1 - x0) * scale).ceil().max(1.0) / scale,
+                y0 + ((y1 - y0) * scale).ceil().max(1.0) / scale,
+            );
+            tiles.push(tile_rect);
+        }
+    }
+    
+    tiles
+}
+
+/// Compute the tile side length in pixels that fits within budget and side limits.
+fn tile_size_for_budget(max_pixels: u64, max_side: u64) -> u64 {
+    let from_pixels = (max_pixels as f64).sqrt() as u64;
+    from_pixels.min(max_side)
+}
+
+/// Render a single tile of art.
+fn render_single_tile(doc: &Document, art: &[Node], tile_rect: Rect, scale: f64, clip: &Option<PathData>, o: &FlattenOptions) -> Result<Raster> {
+    let px = 1.0 / scale;
+    let tile_clip = clip.as_ref().map(|c| {
+        Some(po::offset_path(c, px, po::Join::Miter, 4.0)).filter(|g| !g.is_empty()).unwrap_or_else(|| c.clone())
+    });
+    
+    let xf = Affine::translate(tile_rect.origin().to_vec2()) * Affine::scale(1.0 / scale);
     let tmp = isolated_doc(doc, art.to_vec());
     let mut r = vectorcraft_render::Renderer::new();
-    let no_alpha = o.no_transparency.is_some() && clip.is_some() && !o.preserve_alpha;
-    // Collect spot colors used in the art for per-ink rendering
+    let no_alpha = o.no_transparency.is_some() && tile_clip.is_some() && !o.preserve_alpha;
+    
     let spot_names = if no_alpha && doc.color_mode == ColorMode::Cmyk {
         collect_spot_names(doc, art)
     } else {
@@ -1008,21 +1085,15 @@ fn render_raster(doc: &Document, art: &[Node], rect: Rect, ppi: f64, clip: Optio
     };
     
     if no_alpha && doc.color_mode == ColorMode::Cmyk {
-        // Drawn as inks over the paper: as screen colours, the file would separate them again,
-        // and a CMYK colour comes back with other inks (K moves into C, M and Y).
         let opts = vectorcraft_render::RenderOptions { background: Some([255; 4]), skip_templates: true, ..Default::default() };
-        let inks = r.render_region_inks(&tmp, region, scale, &opts);
+        let inks = r.render_region_inks(&tmp, tile_rect, scale, &opts);
         vectorcraft_doc::cancel::check()?;
-        let (width, height) = vectorcraft_render::region_pixels(region, scale);
-        // Past the size of a CMYK image: drawn in screen colours, below.
+        let (width, height) = vectorcraft_render::region_pixels(tile_rect, scale);
         if let Some(blob) = Inks::new(width, height, inks).and_then(|i| ImageBlob::cmyk_tiff(&i)) {
-            // Render spot tint images for each spot color used
             let mut spot_images = vec![];
             for spot_name in &spot_names {
-                if let Some(tint_pixels) = render_spot_tint(doc, art, spot_name, region, scale) {
-                    // Get the CMYK alternate for this spot
+                if let Some(tint_pixels) = render_spot_tint(doc, art, spot_name, tile_rect, scale) {
                     let alternate = spot_alternate(doc, spot_name);
-                    // Encode as grayscale PNG
                     if let Ok(png) = grayscale_png(width, height, &tint_pixels) {
                         spot_images.push(SpotImage {
                             name: spot_name.clone(),
@@ -1032,20 +1103,18 @@ fn render_raster(doc: &Document, art: &[Node], rect: Rect, ppi: f64, clip: Optio
                     }
                 }
             }
-            return Ok(Raster { blob, width, height, xf, clip, spot_images });
+            return Ok(Raster { blob, width, height, xf, clip: tile_clip, spot_images });
         }
     }
-    let mut img = r.render_region(&tmp, region, scale, !o.preserve_alpha);
-    // The drawing stops early when cancelled: this image is not whole.
+    
+    let mut img = r.render_region(&tmp, tile_rect, scale, !o.preserve_alpha);
     vectorcraft_doc::cancel::check()?;
+    
     if no_alpha {
-        // Without transparency the clip alone shapes the image: it is opaque, over white (its
-        // edge pixels too).
         for p in img.pixels.as_chunks_mut::<4>().0 {
             p[3] = 255;
         }
     } else if !o.preserve_alpha || !o.anti_alias {
-        // The art's coverage: drawn opaque, so only its own edges (and soft effects) are partial.
         let cover: Vec<Node> = art
             .iter()
             .map(|n| {
@@ -1054,7 +1123,7 @@ fn render_raster(doc: &Document, art: &[Node], rect: Rect, ppi: f64, clip: Optio
                 c
             })
             .collect();
-        let cover = r.render_region(&isolated_doc(doc, cover), region, scale, false);
+        let cover = r.render_region(&isolated_doc(doc, cover), tile_rect, scale, false);
         for (px, c) in img.pixels.as_chunks_mut::<4>().0.iter_mut().zip(cover.pixels.as_chunks::<4>().0) {
             let k = c[3];
             let k2 = if o.anti_alias || k == 0 || k == 255 {
@@ -1078,36 +1147,20 @@ fn render_raster(doc: &Document, art: &[Node], rect: Rect, ppi: f64, clip: Optio
             }
         }
     }
+    
     let png = img.to_png().map_err(|e| EngineError::Other(format!("Flatten Transparency: {e}")))?;
-    Ok(Raster { blob: ImageBlob::new("image/png", png), width: img.width, height: img.height, xf, clip, spot_images: vec![] })
+    Ok(Raster { blob: ImageBlob::new("image/png", png), width: img.width, height: img.height, xf, clip: tile_clip, spot_images: vec![] })
 }
 
 /// Pixels per point of an image of `rect` at `ppi`: lower when the image would be larger than
 /// [`MAX_PIXELS`], or have a side longer than the renderer draws (the image grows by a pixel on
-/// each side and is rounded up to whole pixels).
+/// each side and is rounded up to whole pixels). Used for computing image dimensions.
 fn raster_scale(rect: Rect, ppi: f64) -> f64 {
     let requested_scale = ppi / 72.0;
-    // Cap by total pixel count to stay within MAX_PIXELS
     let pixel_capped_scale = (MAX_PIXELS / (rect.width() * rect.height()).max(1.0)).sqrt();
-    // Cap by side length to stay within renderer limits
     let side_capped_scale = (f64::from(vectorcraft_render::MAX_RASTER_SIDE) - 4.0) / rect.width().max(rect.height()).max(1.0);
     
-    let scale = requested_scale.min(pixel_capped_scale).min(side_capped_scale);
-    
-    // Log when resolution is significantly reduced (more than 10% below requested)
-    if scale < requested_scale * 0.9 {
-        let actual_ppi = scale * 72.0;
-        let (w, h) = (rect.width(), rect.height());
-        log::info!(
-            "Raster resolution reduced from {:.0} to {:.0} ppi for {:.0}×{:.0} pt area \
-            (would exceed {}M pixel limit or {} px side limit)",
-            ppi, actual_ppi, w, h,
-            MAX_PIXELS as u64 / 1_000_000,
-            vectorcraft_render::MAX_RASTER_SIDE
-        );
-    }
-    
-    scale
+    requested_scale.min(pixel_capped_scale).min(side_capped_scale)
 }
 
 /// `n` at full opacity with Normal blending throughout (objects, fills and strokes).
@@ -1211,7 +1264,8 @@ pub(super) fn apply(d: &mut Document, sel: &mut vectorcraft_doc::Selection, plan
         // The images go under the regions, reaching a pixel past their own: their edges then fall on
         // matching pixels instead of on what is behind the group.
         // raster_nodes returns the main CMYK image first, then spot tint images layered above it.
-        if let Some(r) = f.raster {
+        // Multiple rasters are tiles covering the region together.
+        for r in f.rasters {
             for node in raster_nodes(d, r) {
                 children.push(Arc::new(node));
             }

@@ -41,6 +41,7 @@ impl<'a> Exporter<'a> {
             lab_spots: vec![],
             interpolate: set.standard != Standard::PdfA2b,
             sweeps: set.standard != Standard::PdfA2b,
+            no_soft_masks: matches!(set.standard, Standard::PdfX1a | Standard::PdfX3),
             // PDF 1.3 and 1.4 files are written with the PDF 1.4 settings ([`Writer::new`]).
             sixteen_bit: !matches!(set.compatibility, Compatibility::Pdf13 | Compatibility::Pdf14),
             compression: &set.compression,

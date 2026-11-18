@@ -427,6 +427,23 @@ impl Exporter<'_> {
             }
             NodeKind::Text(t) => self.text(s, n, t, page),
             NodeKind::Image(im) => match (n.extras().colorize.as_deref(), self.doc.shown_image(n, im)) {
+                (Some(p @ Paint::Solid { swatch: Some(swatch_name), .. }), im)
+                    if self.no_soft_masks && self.doc.spot_names().contains(swatch_name) && self.doc.image_blob(&im).is_none_or(vectorcraft_doc::ImageBlob::takes_colorize) =>
+                {
+                    // X-1a/X-3: spot colorize as a Separation tint image (no soft mask).
+                    let im = &*im;
+                    if writable(s, im.xf, Rect::new(0.0, 0.0, im.width.max(1).into(), im.height.max(1).into())) {
+                        if let Some(spot_img) = self.spot_tint_image(im, p, !n.extras().pixelated) {
+                            self.image(s, im, Some(spot_img), n.extras().pixelated);
+                        } else {
+                            self.image_left_out = self.image_left_out.map(|_| true);
+                            self.warn(UNDECODED);
+                        }
+                    } else if self.image_left_out.is_some() {
+                        self.image_left_out = Some(true);
+                        self.warn(super::exporter::UNWRITABLE_IMAGE);
+                    }
+                }
                 (Some(p @ Paint::Solid { .. }), im) if self.doc.image_blob(&im).is_none_or(vectorcraft_doc::ImageBlob::takes_colorize) => {
                     let im = &*im;
                     if writable(s, im.xf, Rect::new(0.0, 0.0, im.width.max(1).into(), im.height.max(1).into())) {

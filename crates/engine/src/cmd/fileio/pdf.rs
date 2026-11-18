@@ -473,6 +473,9 @@ fn flatten_for(cmd: &str, doc: &Document, set: &PdfSettings, p: &Value) -> Resul
     // Without soft masks a rasterized area can't be a rectangle with see-through pixels around
     // its art: it is clipped to its regions (opaque inside them).
     o.clip_complex_regions = true;
+    // Keep spot tint images (grayscale image + solid spot paint) as-is: they are written as
+    // /Separation tint images and shouldn't be re-flattened.
+    o.keeps_spot_tint_images = true;
     let mut flat = flatten_document(shown.as_ref().unwrap_or(doc), &o)?;
     // Safety net: flatten up to 3 more times if transparency remains (e.g. nested blend modes,
     // multi-clip-group structures the first pass didn't catch).
