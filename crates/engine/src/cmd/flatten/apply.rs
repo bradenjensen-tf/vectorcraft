@@ -227,7 +227,9 @@ fn recolor_paint_for_spot(paint: &Paint, spot_name: &str) -> Paint {
             let mut g = g.clone();
             let mut has_spot = false;
             for stop in &mut g.gradient.stops {
-                if stop.swatch.as_deref() == Some(spot_name) {
+                if stop.swatch.as_deref() == Some(spot_name) 
+                    || (spot_name == vectorcraft_color::swatch::REGISTRATION 
+                        && stop.swatch.as_deref() == Some(vectorcraft_color::swatch::REGISTRATION)) {
                     has_spot = true;
                     stop.color = Color::gray(stop.tint);
                     stop.swatch = None;
@@ -243,6 +245,8 @@ fn recolor_paint_for_spot(paint: &Paint, spot_name: &str) -> Paint {
                 Paint::None
             }
         }
+        // Patterns don't carry spot colors directly - hide them on spot renders
+        Paint::Pattern { .. } => Paint::None,
         _ => Paint::None, // Non-spot colors become transparent
     }
 }
@@ -1120,24 +1124,60 @@ fn region_fills(elems: &[Elem], sources: &[usize], o: &FlattenOptions, cmyk: boo
         Composer { sources, top: None, fill_stack: vec![], plane: 1 }.eval(elems, CLEAR)[0]
     });
     
-    // When preserve_overprints is on, check for stacked overprinting fills.
-    // We need to return the base non-overprinting fill plus all overprinting fills above it.
+    // When preserve_overprints is on, preserve spot fills as separate regions
+    // so each spot gets its own separation plate in the output.
     if o.preserve_overprints && !c.fill_stack.is_empty() {
-        // Find the last non-overprinting fill (the base).
-        // If all fills overprint, the bottom one becomes the "base" for compositing purposes.
-        let base_idx = c.fill_stack.iter().rposition(|f| !f.overprint).unwrap_or(0);
+        let is_spot = |f: &Fill| {
+            matches!(&f.paint, Paint::Solid { swatch: Some(_), .. }) || f.paint.is_registration()
+        };
+        let is_opaque_normal = |f: &Fill| f.opacity >= 1.0 - 1e-4 && f.blend == BlendMode::Normal;
         
-        // Check if we can preserve the fill stack: all fills must be opaque Normal blending.
-        let can_preserve = c.fill_stack[base_idx..].iter().all(|f| {
-            f.opacity >= 1.0 - 1e-4 && f.blend == BlendMode::Normal
-        });
+        // Collect ALL opaque Normal spot fills from the entire stack.
+        let mut spot_regions: Vec<RegionFill> = vec![];
+        // Track the topmost non-overprinting fill (the base).
+        let mut base_fill: Option<&Fill> = None;
         
-        if can_preserve && c.fill_stack.len() > base_idx + 1 {
-            // Multiple fills to emit: base + overprinting fills above it.
-            // Each fill keeps its original paint (preserving spot colors) and overprint flag.
-            return c.fill_stack[base_idx..].iter().map(|f| {
-                RegionFill { paint: f.paint.clone(), alpha: 1.0, overprint: f.overprint }
-            }).collect();
+        for f in &c.fill_stack {
+            if is_opaque_normal(f) {
+                if is_spot(f) {
+                    // Preserve spot fills - emit them with their original overprint flag
+                    spot_regions.push(RegionFill { paint: f.paint.clone(), alpha: 1.0, overprint: f.overprint });
+                }
+                // Track base: a non-overprinting fill becomes the new base
+                if !f.overprint {
+                    base_fill = Some(f);
+                }
+            }
+        }
+        
+        if !spot_regions.is_empty() {
+            // Emit base + spots. The base is the last non-overprinting fill (if any).
+            // Don't use the fully composited `px` as it would include spot contributions
+            // which would then be double-painted when spots are emitted with overprint.
+            let mut regions = vec![];
+            
+            if let Some(base) = base_fill {
+                if is_spot(base) {
+                    // Base is itself a spot - it's already in spot_regions, nothing more needed
+                } else {
+                    // Base is a process fill - emit it as the base region
+                    let [r, g, b] = base.planes[0];
+                    let bk = cmyk.then(|| base.planes[1][0]);
+                    let color = match bk {
+                        Some(k) => {
+                            let [c, m, y, k] = planes_cmyk([r, g, b], k);
+                            Color::cmyk(c, m, y, k)
+                        }
+                        None => Color::rgb(r, g, b),
+                    };
+                    regions.push(RegionFill { paint: Paint::solid(color), alpha: 1.0, overprint: false });
+                }
+            }
+            
+            regions.extend(spot_regions);
+            if !regions.is_empty() {
+                return regions;
+            }
         }
     }
     
@@ -1279,8 +1319,8 @@ fn render_single_tile(doc: &Document, art: &[Node], tile_rect: Rect, scale: f64,
             let mut spot_images = vec![];
             for spot_name in &spot_names {
                 if let Some(tint_pixels) = render_spot_tint(doc, art, spot_name, tile_rect, scale) {
-                    // Skip tiles with no ink (all zeros) - saves file size for unused spot plates
-                    let has_ink = tint_pixels.iter().any(|&p| p > 0);
+                    // Skip tiles with no ink - 255 = white = no ink, <255 = has ink
+                    let has_ink = tint_pixels.iter().any(|&p| p < 255);
                     if !has_ink {
                         continue;
                     }

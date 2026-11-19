@@ -1486,3 +1486,58 @@ fn pdfx_1a_overprint_stack_preserves_all_spots() {
     assert!(has_spot_b, "SpotB (overprint) should appear in PDF");
     assert!(has_spot_c, "SpotC (overprint) should appear in PDF");
 }
+
+/// Test: Tiles with no spot ink don't emit spot images for that tile.
+/// This verifies the zero-tint skip optimization works correctly.
+#[test]
+fn pdfx_1a_zero_tint_tile_skips_spot_image() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    // Create a large document that will tile (500x500 at 300ppi = many tiles)
+    run(&mut s, "file.new", json!({"width": 500, "height": 500, "colorMode": "cmyk"}));
+    
+    // Add a Registration swatch
+    s.execute("swatch.new", &json!({
+        "name": "[Registration]",
+        "spot": true,
+        "color": {"c": 1.0, "m": 1.0, "y": 1.0, "k": 1.0}
+    })).unwrap();
+    
+    // Add a spot swatch
+    s.execute("swatch.new", &json!({
+        "name": "TestSpot",
+        "spot": true,
+        "color": {"c": 0.5, "m": 0.0, "y": 0.0, "k": 0.0}
+    })).unwrap();
+    
+    // Create a small spot rectangle in one corner only (not covering most tiles)
+    let spot_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 10.0, "width": 50.0, "height": 50.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [spot_id], "swatch": "TestSpot"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [spot_id], "none": true}));
+    
+    // Create a semi-transparent overlay to trigger flattening with rasterization
+    let trans_id = run(&mut s, "shape.rectangle", json!({"x": 0.0, "y": 0.0, "width": 500.0, "height": 500.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [trans_id], "color": {"c": 0.1, "m": 0.1, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [trans_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [trans_id], "opacity": 50}));
+    
+    // Export with low balance to force rasterization
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"balance": 0, "lineArtPpi": 150}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // Count spot image references - should be limited (not in every tile)
+    // The spot is only in one corner, so most tiles should NOT have spot images
+    let spot_refs = text.matches("TestSpot").count();
+    
+    // With a 500x500 document at 150ppi, we'd have multiple tiles.
+    // The spot should only appear in tiles that actually have spot content.
+    // If spot_refs is > 10, the zero-tint skip isn't working (would be many more with every tile).
+    assert!(spot_refs > 0, "TestSpot should appear in at least some tiles");
+    assert!(spot_refs < 20, "TestSpot should not appear in tiles with no spot content (got {} refs)", spot_refs);
+}
