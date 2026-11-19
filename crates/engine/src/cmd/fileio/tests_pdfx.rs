@@ -1541,3 +1541,91 @@ fn pdfx_1a_zero_tint_tile_skips_spot_image() {
     assert!(spot_refs > 0, "TestSpot should appear in at least some tiles");
     assert!(spot_refs < 20, "TestSpot should not appear in tiles with no spot content (got {} refs)", spot_refs);
 }
+
+/// Test: An opaque white Normal non-overprint rectangle on top of a spot knocks out the spot.
+/// But Multiply-blend or 50%-opacity rectangles should NOT knock out (spot ink shows through).
+#[test]
+fn pdfx_1a_white_knockout_removes_spot_ink() {
+    use crate::cmd::flatten::render_spot_tint_test;
+    
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 100, "height": 100, "colorMode": "cmyk"}));
+    
+    // Add a spot swatch
+    s.execute("swatch.new", &json!({
+        "name": "TestSpot",
+        "spot": true,
+        "color": {"c": 1.0, "m": 0.0, "y": 0.0, "k": 0.0}
+    })).unwrap();
+    
+    // Create a spot rectangle covering the whole page
+    let spot_id = run(&mut s, "shape.rectangle", json!({"x": 0.0, "y": 0.0, "width": 100.0, "height": 100.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [spot_id], "swatch": "TestSpot"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [spot_id], "none": true}));
+    
+    // Create an opaque white Normal non-overprint rectangle on top (should knock out)
+    let white_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 10.0, "width": 30.0, "height": 30.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [white_id], "color": {"c": 0.0, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [white_id], "none": true}));
+    // Ensure not overprinting (default should be false, but be explicit)
+    s.execute("attributes.set", &json!({"ids": [white_id], "overprintFill": false})).unwrap();
+    
+    // Create a Multiply-blend white rectangle (should NOT knock out)
+    let multiply_id = run(&mut s, "shape.rectangle", json!({"x": 50.0, "y": 10.0, "width": 30.0, "height": 30.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [multiply_id], "color": {"c": 0.0, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [multiply_id], "none": true}));
+    s.execute("transparency.set", &json!({"ids": [multiply_id], "blend": "multiply"})).unwrap();
+    
+    // Create a 50% opacity white rectangle (should NOT knock out)
+    let trans_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 50.0, "width": 30.0, "height": 30.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [trans_id], "color": {"c": 0.0, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [trans_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [trans_id], "opacity": 50}));
+    
+    // Create an overprinting white rectangle (should NOT knock out)
+    let overprint_id = run(&mut s, "shape.rectangle", json!({"x": 50.0, "y": 50.0, "width": 30.0, "height": 30.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overprint_id], "color": {"c": 0.0, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overprint_id], "none": true}));
+    s.execute("attributes.set", &json!({"ids": [overprint_id], "overprintFill": true})).unwrap();
+    
+    // Render the spot tint for the whole document
+    let doc_state = s.doc().unwrap();
+    let doc = &doc_state.doc;
+    // Get all art from layers
+    let art: Vec<_> = doc.layers.iter().flat_map(|l| l.children().into_iter().flatten()).map(|n| (**n).clone()).collect();
+    let region = vectorcraft_geom::Rect::new(0.0, 0.0, 100.0, 100.0);
+    let scale = 1.0; // 72 ppi for simplicity
+    
+    let tint = render_spot_tint_test(doc, &art, "TestSpot", region, scale);
+    
+    // Check pixel values in different regions:
+    // - Under opaque white Normal non-overprint: should be 255 (no ink / knocked out)
+    // - Under Multiply-blend white: should be < 255 (spot ink shows)
+    // - Under 50% opacity white: should be < 255 (spot ink shows)
+    // - Under overprinting white: should be < 255 (spot ink shows)
+    // - Elsewhere: should be < 255 (spot ink)
+    
+    // Sample pixels (at scale 1.0, pixel coords = point coords)
+    let px = |x: usize, y: usize| tint[y * 100 + x];
+    
+    // Center of opaque white knockout area (25, 25)
+    let knockout_px = px(25, 25);
+    assert_eq!(knockout_px, 255, "Opaque white Normal non-overprint should knock out spot (expected 255/no ink, got {})", knockout_px);
+    
+    // Center of Multiply-blend area (65, 25)
+    let multiply_px = px(65, 25);
+    assert!(multiply_px < 255, "Multiply-blend white should NOT knock out spot (expected <255, got {})", multiply_px);
+    
+    // Center of 50% opacity area (25, 65)
+    let trans_px = px(25, 65);
+    assert!(trans_px < 255, "50% opacity white should NOT knock out spot (expected <255, got {})", trans_px);
+    
+    // Center of overprinting area (65, 65)
+    let overprint_px = px(65, 65);
+    assert!(overprint_px < 255, "Overprinting white should NOT knock out spot (expected <255, got {})", overprint_px);
+    
+    // Uncovered spot area (5, 5)
+    let spot_px = px(5, 5);
+    assert!(spot_px < 255, "Uncovered spot should have ink (expected <255, got {})", spot_px);
+}

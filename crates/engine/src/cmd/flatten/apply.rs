@@ -190,22 +190,34 @@ fn recolor_node_for_spot(n: &Node, spot_name: &str) -> Node {
         }
         // Image is colorized with this spot - recolor its colorize paint to grayscale
         if let Some(colorize) = n.extras_mut().colorize.as_mut() {
-            **colorize = recolor_paint_for_spot(colorize, spot_name);
+            **colorize = recolor_paint_for_spot(colorize, spot_name, true);
         }
         return n;
     }
     
-    // Handle appearance items (fills and strokes for most node types)
-    for item in &mut n.appearance.items {
-        let paint = item.paint_mut();
-        *paint = recolor_paint_for_spot(paint, spot_name);
+    // Handle appearance items (fills and strokes for most node types).
+    // For non-spot paints: if opaque, Normal blend, non-overprint, they should knock out
+    // the spot (become white/no-ink). Otherwise they become transparent (Paint::None).
+    let mut app = (*n.appearance).clone();
+    for item in &mut app.items {
+        let is_knockout = item.opacity() >= 1.0 - 1e-4 
+            && item.blend() == BlendMode::Normal 
+            && !item.overprint();
+        *item.paint_mut() = recolor_paint_for_spot(item.paint(), spot_name, is_knockout);
     }
+    n.appearance = vectorcraft_doc::Shared::new(app);
     
-    // Handle text runs - their fill and stroke paints are separate from appearance items
+    // Handle text runs - their fill and stroke paints are separate from appearance items.
+    // Text runs have their own overprint settings in CharStyle.
     if let NodeKind::Text(t) = &mut n.kind {
         for r in &mut t.runs {
-            r.style.fill = recolor_paint_for_spot(&r.style.fill, spot_name);
-            r.style.stroke = recolor_paint_for_spot(&r.style.stroke, spot_name);
+            // Text fill: check if it's a knockout (opaque, Normal, non-overprint)
+            // Text runs don't have per-run opacity/blend, so assume opaque Normal.
+            // Check overprint from CharStyle.
+            let fill_knockout = !r.style.overprint_fill;
+            let stroke_knockout = !r.style.overprint_stroke;
+            r.style.fill = recolor_paint_for_spot(&r.style.fill, spot_name, fill_knockout);
+            r.style.stroke = recolor_paint_for_spot(&r.style.stroke, spot_name, stroke_knockout);
         }
     }
     
@@ -218,7 +230,14 @@ fn recolor_node_for_spot(n: &Node, spot_name: &str) -> Node {
     n
 }
 
-fn recolor_paint_for_spot(paint: &Paint, spot_name: &str) -> Paint {
+/// Recolor a paint for spot tint extraction.
+/// - Paints with the target spot become grayscale (tint as gray value).
+/// - Non-spot paints: if `knockout` is true (opaque, Normal, non-overprint), become white
+///   (no ink) to properly knock out the spot below. Otherwise become transparent (Paint::None).
+fn recolor_paint_for_spot(paint: &Paint, spot_name: &str, knockout: bool) -> Paint {
+    // White paint for knockout: 0 ink = white in grayscale
+    let white = || Paint::Solid { color: Color::gray(0.0), swatch: None, tint: 1.0 };
+    
     match paint {
         // Handle Registration specially: match by is_registration() rather than name comparison
         p if spot_name == vectorcraft_color::swatch::REGISTRATION && p.is_registration() => {
@@ -243,20 +262,28 @@ fn recolor_paint_for_spot(paint: &Paint, spot_name: &str) -> Paint {
                     stop.color = Color::gray(stop.tint);
                     stop.swatch = None;
                     stop.tint = 1.0;
+                } else if knockout {
+                    // Non-spot stops in a knockout context become white (no ink)
+                    stop.color = Color::gray(0.0);
+                    stop.swatch = None;
+                    stop.tint = 1.0;
+                    stop.opacity = 1.0;
                 } else {
-                    // Other colors become transparent
+                    // Non-spot stops in non-knockout context become transparent
                     stop.opacity = 0.0;
                 }
             }
-            if has_spot {
+            if has_spot || knockout {
                 Paint::Gradient(g)
             } else {
                 Paint::None
             }
         }
-        // Patterns don't carry spot colors directly - hide them on spot renders
-        Paint::Pattern { .. } => Paint::None,
-        _ => Paint::None, // Non-spot colors become transparent
+        // Patterns: if knockout, become white; otherwise transparent
+        Paint::Pattern { .. } => if knockout { white() } else { Paint::None },
+        // Non-spot solid colors: if knockout, become white; otherwise transparent
+        Paint::Solid { .. } => if knockout { white() } else { Paint::None },
+        Paint::None => Paint::None,
     }
 }
 
@@ -2194,4 +2221,17 @@ mod tests {
                 "preserved spots should include at least one of the spot nodes");
         }
     }
+}
+
+/// Test helper: render spot tint for a spot color.
+/// Returns grayscale pixels where 0 = full ink, 255 = no ink.
+#[cfg(test)]
+pub fn render_spot_tint_test(
+    doc: &Document,
+    art: &[Node],
+    spot_name: &str,
+    region: Rect,
+    scale: f64,
+) -> Vec<u8> {
+    render_spot_tint(doc, art, spot_name, region, scale).unwrap_or_default()
 }
