@@ -1320,7 +1320,7 @@ fn pdfx_1a_many_consecutive_overprint_spot_paths_preserved() {
         "Consecutive overprint spot paths should be preserved as vector spots, not rasterized to DeviceCMYK. PDF should contain Check_Text colorant.");
 }
 
-/// Test: PDF/X-1a export is deterministic (byte-identical on double export).
+/// Test: PDF/X-1a export is deterministic (byte-identical on double export, ignoring ModDate).
 /// This verifies that spot image stacking order is stable across exports.
 #[test]
 fn pdfx_1a_export_is_deterministic() {
@@ -1363,5 +1363,126 @@ fn pdfx_1a_export_is_deterministic() {
     let v2 = s.execute("document.exportPdf", &p).unwrap();
     let bytes2 = vectorcraft_format::base64_decode(v2["dataBase64"].as_str().unwrap()).unwrap();
     
-    assert_eq!(bytes1, bytes2, "PDF/X-1a export should be byte-identical across runs (deterministic spot ordering)");
+    // Strip all timestamps from PDFs before comparing (ModDate, ModifyDate, CreateDate, etc.)
+    let strip_timestamps = |bytes: &[u8]| -> Vec<u8> {
+        let text = String::from_utf8_lossy(bytes);
+        let mut result = String::new();
+        let mut i = 0;
+        let chars: Vec<char> = text.chars().collect();
+        
+        // Patterns to strip: /ModDate(...), <xmp:ModifyDate>...</xmp:ModifyDate>, <xmp:CreateDate>...</xmp:CreateDate>
+        while i < chars.len() {
+            // Check /ModDate(...)
+            if i + 8 <= chars.len() && chars[i..i+8].iter().collect::<String>() == "/ModDate" {
+                result.push_str("/ModDate(STRIPPED)");
+                while i < chars.len() && chars[i] != '(' {
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1;
+                    while i < chars.len() && chars[i] != ')' {
+                        i += 1;
+                    }
+                    if i < chars.len() {
+                        i += 1;
+                    }
+                }
+            }
+            // Check <xmp:ModifyDate>...</xmp:ModifyDate>
+            else if i + 16 <= chars.len() && chars[i..i+16].iter().collect::<String>() == "<xmp:ModifyDate>" {
+                result.push_str("<xmp:ModifyDate>STRIPPED</xmp:ModifyDate>");
+                while i < chars.len() && !(i + 17 <= chars.len() && chars[i..i+17].iter().collect::<String>() == "</xmp:ModifyDate>") {
+                    i += 1;
+                }
+                if i + 17 <= chars.len() {
+                    i += 17;
+                }
+            }
+            // Check <xmp:CreateDate>...</xmp:CreateDate>
+            else if i + 16 <= chars.len() && chars[i..i+16].iter().collect::<String>() == "<xmp:CreateDate>" {
+                result.push_str("<xmp:CreateDate>STRIPPED</xmp:CreateDate>");
+                while i < chars.len() && !(i + 17 <= chars.len() && chars[i..i+17].iter().collect::<String>() == "</xmp:CreateDate>") {
+                    i += 1;
+                }
+                if i + 17 <= chars.len() {
+                    i += 17;
+                }
+            }
+            else {
+                result.push(chars[i]);
+                i += 1;
+            }
+        }
+        result.into_bytes()
+    };
+    
+    let bytes1_stripped = strip_timestamps(&bytes1);
+    let bytes2_stripped = strip_timestamps(&bytes2);
+    
+    assert_eq!(bytes1_stripped, bytes2_stripped, 
+        "PDF/X-1a export should be byte-identical across runs (deterministic spot ordering)");
+}
+
+/// Test: Overlapping opaque spot paths with overprint preserve all spots in the overlap.
+/// Three overlapping paths: A (no overprint), B (overprint), C (overprint).
+/// All three colorants must appear in the overlap region, not just the topmost.
+#[test]
+fn pdfx_1a_overprint_stack_preserves_all_spots() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    
+    // Add three spot swatches
+    for (name, c, m, y, k) in [
+        ("SpotA", 1.0, 0.0, 0.0, 0.0),
+        ("SpotB", 0.0, 1.0, 0.0, 0.0),
+        ("SpotC", 0.0, 0.0, 1.0, 0.0),
+    ] {
+        s.execute("swatch.new", &json!({
+            "name": name,
+            "spot": true,
+            "color": {"c": c, "m": m, "y": y, "k": k}
+        })).unwrap();
+    }
+    
+    // Create three overlapping rectangles at the same position
+    // A at bottom (no overprint), B in middle (overprint), C on top (overprint)
+    let a_id = run(&mut s, "shape.rectangle", json!({"x": 50.0, "y": 50.0, "width": 100.0, "height": 100.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [a_id], "swatch": "SpotA"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [a_id], "none": true}));
+    // A does NOT overprint
+    
+    let b_id = run(&mut s, "shape.rectangle", json!({"x": 50.0, "y": 50.0, "width": 100.0, "height": 100.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [b_id], "swatch": "SpotB"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [b_id], "none": true}));
+    s.execute("attributes.set", &json!({"ids": [b_id], "overprintFill": true})).unwrap();
+    
+    let c_id = run(&mut s, "shape.rectangle", json!({"x": 50.0, "y": 50.0, "width": 100.0, "height": 100.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [c_id], "swatch": "SpotC"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [c_id], "none": true}));
+    s.execute("attributes.set", &json!({"ids": [c_id], "overprintFill": true})).unwrap();
+    
+    // Add a 50% opacity group elsewhere to trigger flattening
+    let trans_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 10.0, "width": 30.0, "height": 30.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [trans_id], "color": {"c": 0.2, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [trans_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [trans_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a (no rasterization - balance 100)
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // All three spots should appear in the PDF
+    let has_spot_a = text.contains("SpotA");
+    let has_spot_b = text.contains("SpotB");
+    let has_spot_c = text.contains("SpotC");
+    
+    assert!(has_spot_a, "SpotA (base, no overprint) should appear in PDF");
+    assert!(has_spot_b, "SpotB (overprint) should appear in PDF");
+    assert!(has_spot_c, "SpotC (overprint) should appear in PDF");
 }

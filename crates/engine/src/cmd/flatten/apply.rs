@@ -174,6 +174,27 @@ fn recolor_node_for_spot(n: &Node, spot_name: &str) -> Node {
         return n;
     }
     
+    // For image nodes: hide them unless their colorize paint is this spot.
+    // This prevents images from bleeding into spot plates they don't belong on.
+    if matches!(n.kind, NodeKind::Image(_)) {
+        let colorize = n.extras().colorize.as_deref();
+        let is_this_spot = match colorize {
+            Some(p) if spot_name == vectorcraft_color::swatch::REGISTRATION && p.is_registration() => true,
+            Some(Paint::Solid { swatch: Some(name), .. }) if name == spot_name => true,
+            _ => false,
+        };
+        if !is_this_spot {
+            // Hide image - it doesn't belong on this spot plate
+            n.visible = false;
+            return n;
+        }
+        // Image is colorized with this spot - recolor its colorize paint to grayscale
+        if let Some(colorize) = n.extras_mut().colorize.as_mut() {
+            **colorize = recolor_paint_for_spot(colorize, spot_name);
+        }
+        return n;
+    }
+    
     for item in &mut n.appearance.items {
         let paint = item.paint_mut();
         *paint = recolor_paint_for_spot(paint, spot_name);
@@ -919,7 +940,8 @@ fn flatten_group(plain: &[&Node], o: &FlattenOptions, cmyk: bool, has_art_below:
     };
     // An arrangement that failed (degenerate geometry) leaves only rasterizing.
     let all = over || regions.is_empty() || o.rasterize_all(regions.len());
-    let mut vector: Vec<(usize, RegionFill)> = vec![];
+    // vector: (region index, fills) where fills may have multiple entries for overprint stacks
+    let mut vector: Vec<(usize, Vec<RegionFill>)> = vec![];
     let mut complex: Vec<usize> = vec![];
     let mut gradients_only = !all;
     for (k, r) in regions.iter().enumerate() {
@@ -928,8 +950,11 @@ fn flatten_group(plain: &[&Node], o: &FlattenOptions, cmyk: bool, has_art_below:
         if all || r.sources.iter().filter(shown).any(|&i| b.kinds[i] != Kind::Vector) {
             gradients_only &= r.sources.iter().filter(shown).all(|&i| b.kinds[i] == Kind::Gradient);
             complex.push(k);
-        } else if let Some(fill) = region_fill(&elems, &r.sources, o, cmyk) {
-            vector.push((k, fill));
+        } else {
+            let fills = region_fills(&elems, &r.sources, o, cmyk);
+            if !fills.is_empty() {
+                vector.push((k, fills));
+            }
         }
     }
     let bounds = |ks: &[usize]| ks.iter().filter_map(|&k| regions[k].path.bounds()).reduce(|a, b| a.union(b));
@@ -1010,7 +1035,13 @@ fn flatten_group(plain: &[&Node], o: &FlattenOptions, cmyk: bool, has_art_below:
         let ppi = if gradients_only { o.gradient_ppi } else { o.line_art_ppi };
         Area { rect, ppi, clip: clip.filter(|c| !c.is_empty()), whole: all }
     });
-    let vector = vector.into_iter().map(|(k, f)| (regions[k].path.clone(), f)).collect();
+    // Flatten the vector: each region may now produce multiple fills (for overprint stacks)
+    let vector: Regions = vector.into_iter()
+        .flat_map(|(k, fills)| {
+            let path = regions[k].path.clone();
+            fills.into_iter().map(move |f| (path.clone(), f))
+        })
+        .collect();
     Some((vector, area))
 }
 
@@ -1069,13 +1100,15 @@ pub(crate) fn with_clips_ignored<T>(f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// The flat colour of a region covered by `sources` (CMYK in a `cmyk` document); `None` where
-/// nothing paints it.
-fn region_fill(elems: &[Elem], sources: &[usize], o: &FlattenOptions, cmyk: bool) -> Option<RegionFill> {
-    let mut c = Composer { sources, top: None, plane: 0 };
+/// The flat colours of a region covered by `sources` (CMYK in a `cmyk` document).
+/// When preserve_overprints is on and overprinting fills stack on top of a non-overprinting base,
+/// returns all fills from the base upward so each can be emitted as a separate region.
+/// Returns empty vec where nothing paints.
+fn region_fills(elems: &[Elem], sources: &[usize], o: &FlattenOptions, cmyk: bool) -> Vec<RegionFill> {
+    let mut c = Composer { sources, top: None, fill_stack: vec![], plane: 0 };
     let alone = c.eval(elems, CLEAR);
     if alone[3] < 0.5 / 255.0 {
-        return None;
+        return vec![];
     }
     // The white goes under the finished art, as under the renderer's: blend modes read only the art.
     let on_page = |p: Px| if o.preserve_alpha { p } else { composite(BlendMode::Normal, WHITE, p) };
@@ -1084,9 +1117,31 @@ fn region_fill(elems: &[Elem], sources: &[usize], o: &FlattenOptions, cmyk: bool
     // The K plane composites the same way.
     let k = cmyk.then(|| {
         c.plane = 1;
-        on_page(c.eval(elems, CLEAR))[0]
+        Composer { sources, top: None, fill_stack: vec![], plane: 1 }.eval(elems, CLEAR)[0]
     });
-    // A paint showing as it is keeps its colour (spot, process, swatch) and overprint.
+    
+    // When preserve_overprints is on, check for stacked overprinting fills.
+    // We need to return the base non-overprinting fill plus all overprinting fills above it.
+    if o.preserve_overprints && !c.fill_stack.is_empty() {
+        // Find the last non-overprinting fill (the base).
+        // If all fills overprint, the bottom one becomes the "base" for compositing purposes.
+        let base_idx = c.fill_stack.iter().rposition(|f| !f.overprint).unwrap_or(0);
+        
+        // Check if we can preserve the fill stack: all fills must be opaque Normal blending.
+        let can_preserve = c.fill_stack[base_idx..].iter().all(|f| {
+            f.opacity >= 1.0 - 1e-4 && f.blend == BlendMode::Normal
+        });
+        
+        if can_preserve && c.fill_stack.len() > base_idx + 1 {
+            // Multiple fills to emit: base + overprinting fills above it.
+            // Each fill keeps its original paint (preserving spot colors) and overprint flag.
+            return c.fill_stack[base_idx..].iter().map(|f| {
+                RegionFill { paint: f.paint.clone(), alpha: 1.0, overprint: f.overprint }
+            }).collect();
+        }
+    }
+    
+    // Single fill: use the composited result
     let near = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-3);
     let same = |f: &Fill| px[3] >= 1.0 - 1e-4 && near(&f.planes[0], &rgb) && k.is_none_or(|k| near(&f.planes[1][..1], &[k]));
     let color = match k {
@@ -1100,7 +1155,7 @@ fn region_fill(elems: &[Elem], sources: &[usize], o: &FlattenOptions, cmyk: bool
         Some(f) if o.preserve_overprints && same(f) => (f.paint.clone(), f.overprint),
         _ => (Paint::solid(color), false),
     };
-    Some(RegionFill { paint, alpha: px[3], overprint })
+    vec![RegionFill { paint, alpha: px[3], overprint }]
 }
 
 /// `art` rendered over `rect` at `ppi`: over white with the white the art doesn't cover taken out
@@ -1224,6 +1279,11 @@ fn render_single_tile(doc: &Document, art: &[Node], tile_rect: Rect, scale: f64,
             let mut spot_images = vec![];
             for spot_name in &spot_names {
                 if let Some(tint_pixels) = render_spot_tint(doc, art, spot_name, tile_rect, scale) {
+                    // Skip tiles with no ink (all zeros) - saves file size for unused spot plates
+                    let has_ink = tint_pixels.iter().any(|&p| p > 0);
+                    if !has_ink {
+                        continue;
+                    }
                     let alternate = spot_alternate(doc, spot_name);
                     if let Ok(png) = grayscale_png(width, height, &tint_pixels) {
                         spot_images.push(SpotImage {
