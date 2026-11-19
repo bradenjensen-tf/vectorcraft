@@ -195,9 +195,18 @@ fn recolor_node_for_spot(n: &Node, spot_name: &str) -> Node {
         return n;
     }
     
+    // Handle appearance items (fills and strokes for most node types)
     for item in &mut n.appearance.items {
         let paint = item.paint_mut();
         *paint = recolor_paint_for_spot(paint, spot_name);
+    }
+    
+    // Handle text runs - their fill and stroke paints are separate from appearance items
+    if let NodeKind::Text(t) = &mut n.kind {
+        for r in &mut t.runs {
+            r.style.fill = recolor_paint_for_spot(&r.style.fill, spot_name);
+            r.style.stroke = recolor_paint_for_spot(&r.style.stroke, spot_name);
+        }
     }
     
     if let Some(children) = n.children_mut() {
@@ -336,13 +345,13 @@ fn render_spot_tint(
     let tmp = isolated_doc(doc, recolored);
     
     let mut r = vectorcraft_render::Renderer::new();
-    let _opts = vectorcraft_render::RenderOptions { 
+    let opts = vectorcraft_render::RenderOptions { 
         background: Some([255, 255, 255, 255]),
         skip_templates: true, 
         ..Default::default() 
     };
     
-    let img = r.render_region(&tmp, region, scale, false);
+    let img = r.render_region_with(&tmp, region, scale, &opts);
     vectorcraft_doc::cancel::check().ok()?;
     
     // Extract grayscale from the rendered image.
