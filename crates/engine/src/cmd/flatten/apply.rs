@@ -1322,14 +1322,58 @@ fn tile_size_for_budget(max_pixels: u64, max_side: u64) -> u64 {
 /// Render a single tile of art.
 fn render_single_tile(doc: &Document, art: &[Node], tile_rect: Rect, scale: f64, clip: &Option<PathData>, o: &FlattenOptions) -> Result<Raster> {
     let px = 1.0 / scale;
-    let tile_clip = clip.as_ref().map(|c| {
-        Some(po::offset_path(c, px, po::Join::Miter, 4.0)).filter(|g| !g.is_empty()).unwrap_or_else(|| c.clone())
+    // Whether there's an original clip (determines opaque path eligibility, independent of tile_clip)
+    let has_clip = clip.is_some();
+    
+    // Intersect the clip with this tile's rect. For tiles fully inside the clip,
+    // we can skip the clip entirely (saves repeating the full clip path).
+    // For partial coverage, we emit only the intersected portion.
+    let tile_clip = clip.as_ref().and_then(|c| {
+        let offset_clip = Some(po::offset_path(c, px, po::Join::Miter, 4.0))
+            .filter(|g| !g.is_empty())
+            .unwrap_or_else(|| c.clone());
+        
+        let tile_inflated = tile_rect.inflate(px, px);
+        let tile_path = shapes::rectangle(tile_inflated);
+        
+        // Always intersect the clip with the tile rect to get only the relevant portion.
+        // This is the key optimization: instead of repeating the full N-subpath clip for each tile,
+        // we emit only the intersection (which is typically just the tile rect or a simple shape).
+        let intersected = po::boolean(&offset_clip, FillRule::NonZero, &tile_path, FillRule::NonZero, po::BoolOp::Intersect);
+        
+        // Check if the tile is fully inside the clip using proper geometric containment:
+        // If (clip ∩ tile) == tile, then the tile is fully inside the clip.
+        // We verify this by checking if the difference (tile - intersected) is empty.
+        if let Some(ib) = intersected.bounds() {
+            let tile_area = tile_inflated.area();
+            let inter_area = ib.area();
+            // If intersection bounds match tile bounds closely, do a proper geometric check
+            if (inter_area - tile_area).abs() < tile_area * 0.02 {
+                // Verify with actual path difference: tile fully inside clip if (tile - clip) is empty
+                let diff = po::boolean(&tile_path, FillRule::NonZero, &offset_clip, FillRule::NonZero, po::BoolOp::Difference);
+                let diff_area = diff.bounds().map(|b| b.area()).unwrap_or(0.0);
+                if diff_area < tile_area * 0.001 {
+                    // Tile is geometrically inside the clip - no clip needed for this tile
+                    return None;
+                }
+            }
+        }
+        
+        // Return the intersected clip (smaller than full clip) if it's non-empty
+        if !intersected.is_empty() {
+            Some(intersected)
+        } else {
+            // Intersection is empty - tile is outside clip, keep original
+            Some(offset_clip)
+        }
     });
     
     let xf = Affine::translate(tile_rect.origin().to_vec2()) * Affine::scale(1.0 / scale);
     let tmp = isolated_doc(doc, art.to_vec());
     let mut r = vectorcraft_render::Renderer::new();
-    let no_alpha = o.no_transparency.is_some() && tile_clip.is_some() && !o.preserve_alpha;
+    // Opaque path eligibility: based on original clip presence, NOT tile_clip presence.
+    // A tile fully inside the clip still needs the opaque CMYK path for X-1a compliance.
+    let no_alpha = o.no_transparency.is_some() && has_clip && !o.preserve_alpha;
     
     let spot_names = if no_alpha && doc.color_mode == ColorMode::Cmyk {
         collect_spot_names(doc, art)
@@ -1679,11 +1723,13 @@ fn kept_seen(n: &Node) {
 #[cfg(not(test))]
 fn kept_seen(_: &Node) {}
 
-/// An image of `r` (in a clip group when it is clipped).
 /// Create nodes from a raster: the main image and any spot tint images.
+/// All images in the same tile share a single clip group (if clipped) to avoid
+/// repeating the clip path once per image.
 /// Spot images use colorize to output as Separation colorspaces with overprint.
 fn raster_nodes(d: &mut Document, r: Raster) -> Vec<Node> {
-    let mut nodes = vec![];
+    // Collect all images for this tile (main + spots) so they can share one clip group
+    let mut images = vec![];
     
     // Main CMYK image
     let key = unique_key(d, "flattened");
@@ -1700,12 +1746,7 @@ fn raster_nodes(d: &mut Document, r: Raster) -> Vec<Node> {
             pixels: None,
         })),
     );
-    
-    let main_node = match &r.clip {
-        Some(path) => crate::cmd::rasterfx::clip_group(d, path.clone(), FillRule::NonZero, image),
-        None => image,
-    };
-    nodes.push(main_node);
+    images.push(image);
     
     // Spot tint images: each is a grayscale image colorized with the spot color
     // Output: the coverage shows where the ink goes, colorize makes it print as that spot
@@ -1739,15 +1780,19 @@ fn raster_nodes(d: &mut Document, r: Raster) -> Vec<Node> {
         for item in &mut spot_image.appearance.items {
             *item.overprint_mut() = true;
         }
-        
-        let spot_node = match &r.clip {
-            Some(path) => crate::cmd::rasterfx::clip_group(d, path.clone(), FillRule::NonZero, spot_image),
-            None => spot_image,
-        };
-        nodes.push(spot_node);
+        images.push(spot_image);
     }
     
-    nodes
+    // If there's a clip, wrap all images in a single shared clip group
+    match r.clip {
+        Some(path) if !images.is_empty() => {
+            // Create a clip group containing all images for this tile
+            let children: Vec<Arc<Node>> = images.into_iter().map(Arc::new).collect();
+            let clip_group = crate::cmd::rasterfx::clip_group_multi(d, path, FillRule::NonZero, children);
+            vec![clip_group]
+        }
+        _ => images,
+    }
 }
 
 /// Do what [`Kept`] `k` found to its object of `d` (`brushes`: the document's brushes, for the

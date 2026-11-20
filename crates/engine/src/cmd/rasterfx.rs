@@ -138,6 +138,12 @@ fn settings(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// `art` in a clip group clipped by `path` filled by `rule` (a clipping path that paints nothing).
 pub(crate) fn clip_group(d: &mut Document, path: PathData, rule: FillRule, art: Node) -> Node {
+    clip_group_multi(d, path, rule, vec![Arc::new(art)])
+}
+
+/// Multiple `children` in a clip group clipped by `path` filled by `rule`.
+/// This allows sharing a single clip path across multiple images in the same tile.
+pub(crate) fn clip_group_multi(d: &mut Document, path: PathData, rule: FillRule, children: Vec<Arc<Node>>) -> Node {
     let mut clip = super::pathops::shape_node(d, path, None);
     clip.appearance = Appearance::basic(Paint::None, Paint::None, 0.0).into();
     match &mut clip.kind {
@@ -145,7 +151,9 @@ pub(crate) fn clip_group(d: &mut Document, path: PathData, rule: FillRule, art: 
         NodeKind::Compound { rule: r, .. } => *r = rule,
         _ => {}
     }
-    Node::new(d.alloc_id(), NodeKind::Group { children: vec![Arc::new(clip), Arc::new(art)], clip: true })
+    let mut all_children = vec![Arc::new(clip)];
+    all_children.extend(children);
+    Node::new(d.alloc_id(), NodeKind::Group { children: all_children, clip: true })
 }
 
 /// Render `nodes` alone over transparency: (premultiplied pixels, width, height).
