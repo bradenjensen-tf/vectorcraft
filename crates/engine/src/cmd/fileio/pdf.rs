@@ -196,9 +196,10 @@ pub(crate) fn pdf_error(cmd: &str, e: PdfError) -> EngineError {
 /// The settings `p` asks for: its preset (built-in or one of `saved`; default
 /// [`DEFAULT_PRESET`]) with `p`'s options applied over it. Choosing another standard turns
 /// Preserve Editing off, the layers off where it has none, and sets the latest compatibility it
-/// allows, unless `p` asks for those. Checked as a preset is
-/// ([`PdfSettings::check_values`]): profiles that aren't there pass. Keys that aren't PDF options
-/// (path, format…) are ignored.
+/// allows, unless `p` asks for those. When explicit bleed values are provided without
+/// `useDocument`, the explicit values are used instead of the document's bleed. Checked as a
+/// preset is ([`PdfSettings::check_values`]): profiles that aren't there pass. Keys that aren't
+/// PDF options (path, format…) are ignored.
 pub fn resolve(cmd: &str, p: &Value, saved: &[PdfPreset]) -> Result<PdfSettings> {
     let base = preset_settings(cmd, p, saved)?;
     if !p.is_object() {
@@ -217,6 +218,15 @@ pub fn resolve(cmd: &str, p: &Value, saved: &[PdfPreset]) -> Result<PdfSettings>
         }
         if !s.standard.allows(s.compatibility) && unasked("compatibility") {
             s.compatibility = s.standard.version();
+        }
+    }
+    // When explicit bleed values are provided without `useDocument`, use them instead of the
+    // document's bleed. This allows the caller to override the default of using document bleed.
+    if let Some(bleed) = p.get("bleed").filter(|v| v.is_object()) {
+        let has_values = ["top", "bottom", "left", "right"].iter().any(|k| bleed.get(k).is_some_and(|v| !v.is_null()));
+        let asks_use_doc = bleed.get("useDocument").is_some_and(|v| !v.is_null());
+        if has_values && !asks_use_doc {
+            s.bleed.use_document = false;
         }
     }
     s.check_values().map_err(|e| pdf_error(cmd, e))?;
@@ -333,12 +343,20 @@ pub fn encode(cmd: &str, doc: &Document, p: &Value) -> Result<(Vec<u8>, Vec<Note
     encode_at(cmd, doc, p, None)
 }
 
+/// Precision (decimal places) for path geometry in the embedded native document: smaller files.
+/// Enough for sub-point accuracy at any scale VectorCraft supports.
+const EDITING_PRECISION: u8 = 4;
+
 /// [`encode`] modified at `modified` (Unix seconds) when given, instead of the time of writing.
 pub(super) fn encode_at(cmd: &str, doc: &Document, p: &Value, modified: Option<i64>) -> Result<(Vec<u8>, Vec<Note>)> {
     // Keep the editable object tree independent of preview fallbacks used by the drawn pages.
     let (full, placed) = crate::cmd::place::document::full_documents(doc);
     let mut notes: Vec<Note> = placed.into_iter().map(Note::loss).collect();
-    let (bytes, drawn) = encode_carrying_at(cmd, &full, p, modified, || Ok(vectorcraft_format::save(doc, false)), || Ok(None))?;
+    // Round path geometry for a smaller embedded file; compact, not pretty.
+    let native_opts = vectorcraft_format::SaveOptions { precision: Some(EDITING_PRECISION), ..Default::default() };
+    let (bytes, drawn) = encode_carrying_at(cmd, &full, p, modified, || {
+        vectorcraft_format::save_with(doc, &native_opts).map_err(|e| bad(cmd, e.to_string()))
+    }, || Ok(None))?;
     notes.extend(drawn);
     if notes.iter().any(|n| n.text.ends_with(SHOWN_SMALLER)) && options(cmd, &full, p)?.settings.standard == Standard::None {
         for n in notes.iter_mut().filter(|n| n.text.ends_with(SHOWN_SMALLER)) {
@@ -455,10 +473,65 @@ fn flatten_for(cmd: &str, doc: &Document, set: &PdfSettings, p: &Value) -> Resul
     // Without soft masks a rasterized area can't be a rectangle with see-through pixels around
     // its art: it is clipped to its regions (opaque inside them).
     o.clip_complex_regions = true;
-    Ok(match flatten_document(shown.as_ref().unwrap_or(doc), &o)? {
+    // Keep spot tint images (grayscale image + solid spot paint) as-is: they are written as
+    // /Separation tint images and shouldn't be re-flattened.
+    o.keeps_spot_tint_images = true;
+    // Clamp over-cap raster rects to the union of all artboard bounds including bleed.
+    // This prevents rasters from extending far beyond the page (Vonco regression fix).
+    let page_bounds = doc.artboards.iter()
+        .map(|a| doc.setup.bleed_rect(a.rect))
+        .reduce(|a, b| a.union(b));
+    o.page_bounds = page_bounds;
+    let mut flat = flatten_document(shown.as_ref().unwrap_or(doc), &o)?;
+    // Safety net: flatten up to 3 more times if transparency remains (e.g. nested blend modes,
+    // multi-clip-group structures the first pass didn't catch).
+    for _ in 0..3 {
+        let d = flat.as_ref().or(shown.as_ref()).unwrap_or(doc);
+        if !d.layers.iter().any(|l| o.shows_transparency(d, l) || o.draws_see_through_image(l)) {
+            break;
+        }
+        flat = flatten_document(d, &o)?.or(flat);
+    }
+    // Final check: if transparency still remains, fail with the offending node ids.
+    if let Some(d) = flat.as_ref().or(shown.as_ref()) {
+        let remaining: Vec<_> = remaining_transparency(d, &o);
+        if !remaining.is_empty() {
+            return Err(bad(
+                cmd,
+                format!(
+                    "transparency remains after flattening: {} nodes ({:?})",
+                    remaining.len(),
+                    remaining.iter().take(10).collect::<Vec<_>>()
+                ),
+            ));
+        }
+    }
+    Ok(match flat {
         Some(flat) => (Some(flat), true),
         None => (shown, false),
     })
+}
+
+/// Node IDs that still show transparency in `doc` with flattener options `o`.
+fn remaining_transparency(doc: &Document, o: &FlattenOptions) -> Vec<vectorcraft_doc::NodeId> {
+    fn collect(doc: &Document, n: &Node, o: &FlattenOptions, out: &mut Vec<vectorcraft_doc::NodeId>) {
+        if !n.visible {
+            return;
+        }
+        if o.shows_transparency(doc, n) || o.draws_see_through_image(n) {
+            out.push(n.id);
+        }
+        if let Some(ch) = n.children() {
+            for c in ch {
+                collect(doc, c, o, out);
+            }
+        }
+    }
+    let mut out = vec![];
+    for l in &doc.layers {
+        collect(doc, l, o, &mut out);
+    }
+    out
 }
 
 /// The pages `opts` export of `doc` drawn on white, [`THUMBNAIL_SIZE`] pixels on their long side:

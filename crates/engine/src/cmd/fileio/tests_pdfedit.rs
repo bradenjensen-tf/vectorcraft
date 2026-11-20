@@ -3,12 +3,21 @@
 //! `.ait` templates open from it untitled.
 
 use serde_json::{Value, json};
+use vectorcraft_doc::Document;
 
 use super::tests_svgedit::{comparable, rich};
 use super::*;
 
 fn b64(v: &Value) -> Vec<u8> {
     vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap_or_else(|| panic!("no dataBase64 in {v}"))).unwrap()
+}
+
+/// `d` without what opening a file sets anew, with geometry rounded to 4 decimals.
+/// AI native format rounds to 4 decimals, so comparing documents needs the same rounding.
+fn comparable_rounded(d: &Document) -> Document {
+    let mut d = comparable(d);
+    d.round_geometry(4);
+    d
 }
 
 fn open(s: &mut Session, name: &str, bytes: &[u8]) -> Value {
@@ -26,6 +35,20 @@ fn patched(pdf: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     let at = pdf.windows(from.len()).position(|w| w == from).unwrap_or_else(|| panic!("no {:?}", String::from_utf8_lossy(from)));
     let mut out = pdf.to_vec();
     out[at..at + to.len()].copy_from_slice(to);
+    out
+}
+
+/// `pdf` with the zstd-compressed editing data corrupted so decompression fails.
+/// Finds the zstd magic bytes (0x28 0xB5 0x2F 0xFD) and corrupts bytes after them.
+fn damage_zstd_payload(pdf: &[u8]) -> Vec<u8> {
+    const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+    let at = pdf.windows(4).position(|w| w == ZSTD_MAGIC).unwrap_or_else(|| panic!("no zstd magic found in PDF"));
+    let mut out = pdf.to_vec();
+    // Corrupt bytes after the magic to invalidate the compressed stream.
+    // The frame header follows the magic; corrupting it makes decompression fail.
+    for i in 4..12.min(out.len() - at) {
+        out[at + i] ^= 0xFF;
+    }
     out
 }
 
@@ -63,7 +86,9 @@ fn pages_changed_elsewhere_open_as_artwork_with_a_warning() {
     assert_eq!((&r["warnings"][0], &r["restored"]), (&json!(load::EDITING_STALE), &json!(false)), "{r}");
     assert!(s.doc().unwrap().doc.symbols.is_empty(), "plain import: no symbols");
     // Editing data that isn't a native document can't be read.
-    let damaged = patched(&pdf, b"{\"format\":\"vectorcraft\"", b"{\"format\":\"vectorcrafX\"");
+    // The native data is zstd-compressed (magic: 0x28 0xB5 0x2F 0xFD). Corrupt bytes after the
+    // magic to make decompression fail. This tests that damaged editing data is detected.
+    let damaged = damage_zstd_payload(&pdf);
     let r = open(&mut s, "damaged.pdf", &damaged);
     assert_eq!(r["warnings"][0], load::EDITING_DAMAGED, "{r}");
 }
@@ -211,7 +236,8 @@ fn a_page_too_long_for_pdf_1_3_fails_before_the_flattening() {
 #[test]
 fn ait_templates_open_their_document_untitled() {
     let mut s = rich();
-    let before = comparable(&s.doc().unwrap().doc);
+    // Round before to 4 decimals because AI native format rounds coordinates.
+    let before = comparable_rounded(&s.doc().unwrap().doc);
     // A never-saved document's .ai comes back as bytes.
     let ai = b64(&s.execute("document.save", &json!({"format": "ai"})).unwrap());
     assert!(ai.starts_with(b"%PDF"));
@@ -219,7 +245,9 @@ fn ait_templates_open_their_document_untitled() {
     assert_eq!((&r["format"], &r["restored"]), (&json!("ait"), &json!(true)), "{r}");
     assert!(r["title"].as_str().unwrap().starts_with("Untitled-"), "{r}");
     assert_eq!(s.doc().unwrap().path, None);
-    assert_eq!(comparable(&s.doc().unwrap().doc), before);
+    // Full document comparison with 4-decimal rounding (AI native format precision).
+    let after = comparable_rounded(&s.doc().unwrap().doc);
+    assert_eq!(after, before, "template round-trip preserves the document");
 }
 
 /// Save as Template writes a PDF-compatible `.ait` for a `.ait` path or `format: ait`, and New
@@ -230,7 +258,8 @@ fn save_as_template_writes_an_ait_that_new_from_template_opens_untitled() {
     let mut s = rich();
     s.execute("layer.new", &json!({"name": "Notes"})).unwrap();
     s.execute("shape.ellipse", &json!({"x": 20, "y": 120, "width": 40, "height": 30})).unwrap();
-    let before = comparable(&s.doc().unwrap().doc);
+    // Round before to 4 decimals because AI native format rounds coordinates.
+    let before = comparable_rounded(&s.doc().unwrap().doc);
     assert_eq!(before.layers.len(), 2);
     let path = tmp(&scratch, "brochure template.ait");
     let r = s.execute("file.saveAsTemplate", &json!({"path": path})).unwrap();
@@ -242,7 +271,9 @@ fn save_as_template_writes_an_ait_that_new_from_template_opens_untitled() {
     assert_eq!(r["format"], "ait", "{r}");
     assert!(r["title"].as_str().unwrap().starts_with("Untitled-"), "{r}");
     assert_eq!(s.doc().unwrap().path, None);
-    assert_eq!(comparable(&s.doc().unwrap().doc), before);
+    // Full document comparison with 4-decimal rounding (AI native format precision).
+    let after = comparable_rounded(&s.doc().unwrap().doc);
+    assert_eq!(after, before, "template round-trip preserves the document");
     // Without a path: the bytes and a name for the Templates folder.
     let r = s.execute("file.saveAsTemplate", &json!({"format": "ait"})).unwrap();
     assert_eq!(r["format"], "ait", "{r}");

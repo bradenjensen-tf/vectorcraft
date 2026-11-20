@@ -469,3 +469,39 @@ fn art_deep_in_tags_inside_a_layer_reaches_it() {
     let shapes = d.layers.iter().find(|l| l.name.as_deref() == Some("Shapes")).unwrap();
     assert_eq!(colors(shapes), [Color::rgb(1.0, 0.0, 0.0)]);
 }
+
+/// Unlisted OCG objects with the same names as listed ones (duplicated in form XObjects by some
+/// PDF writers) map to the listed ones, not to new layers.
+#[test]
+fn unlisted_ocgs_with_same_names_as_listed_ones_map_to_them() {
+    // For 1 page: first_extra(1) = 5, so extra objects start at 5.
+    // Listed groups: Marks (obj 5) and Art (obj 6).
+    let marks_listed = "<< /Type /OCG /Name (Marks) >>";
+    let art_listed = "<< /Type /OCG /Name (Art) >>";
+    // Unlisted twins with the same names (obj 7 and 8), used by a form XObject.
+    let marks_twin = "<< /Type /OCG /Name (Marks) >>";
+    let art_twin = "<< /Type /OCG /Name (Art) >>";
+    // A form XObject (obj 9) that uses the unlisted twins.
+    let form = stream(
+        "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /Properties << /MC2 7 0 R /MC3 8 0 R >> >>",
+        "/OC /MC2 BDC 0 0 1 rg 60 60 20 20 re f EMC /OC /MC3 BDC 0 1 1 rg 80 80 10 10 re f EMC",
+    );
+    // A page that uses the listed groups and draws the form.
+    let page = PdfPage {
+        resources: "/Properties << /MC0 5 0 R /MC1 6 0 R >> /XObject << /X0 9 0 R >>".into(),
+        ..PdfPage::new(100.0, 100.0, "/OC /MC0 BDC 1 0 0 rg 10 10 30 30 re f EMC /OC /MC1 BDC 0 1 0 rg 50 50 30 30 re f EMC /X0 Do")
+    };
+    // Catalog listing only obj 5 and 6 in /OCProperties.
+    let catalog = "/OCProperties << /OCGs [5 0 R 6 0 R] /D << /Order [5 0 R 6 0 R] >> >>";
+    let pdf = pdf_with_catalog(&[page], &[marks_listed, art_listed, marks_twin, art_twin, &form], catalog, None);
+    let d = import(&pdf).unwrap();
+    // Should have 2 layers (Marks, Art), not 4 (Marks, Art, Marks, Art).
+    assert_eq!(names(&d), ["Marks", "Art"], "layer names: {:?}", names(&d));
+    // Art from the form should be in the same layers as art from the page.
+    let marks = d.layers.iter().find(|l| l.name.as_deref() == Some("Marks")).unwrap();
+    let art = d.layers.iter().find(|l| l.name.as_deref() == Some("Art")).unwrap();
+    // Marks layer should have 2 shapes (from page and form).
+    assert_eq!(colors(marks), [Color::rgb(1.0, 0.0, 0.0), Color::rgb(0.0, 0.0, 1.0)]);
+    // Art layer should have 2 shapes (from page and form).
+    assert_eq!(colors(art), [Color::rgb(0.0, 1.0, 0.0), Color::rgb(0.0, 1.0, 1.0)]);
+}

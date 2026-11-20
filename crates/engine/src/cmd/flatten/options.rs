@@ -2,7 +2,7 @@ use super::analysis::draws_image;
 use super::apply::{apply, plan};
 use super::presets::{FlattenerPreset, saved_preset};
 use super::report::target_roots;
-use super::{BTreeSet, Deserialize, Document, EngineError, Node, NodeKind, Paint, Result, Serialize, Session, Value, bad, json, str_param};
+use super::{BTreeSet, Deserialize, Document, EngineError, Node, NodeKind, Paint, Rect, Result, Serialize, Session, Value, bad, json, str_param};
 
 /// Object → Flatten Transparency settings: a preset's, adjusted by the command's params.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -38,6 +38,14 @@ pub struct FlattenOptions {
     /// itself doesn't count as transparency. Not a preset option.
     #[serde(skip)]
     pub keeps_colorize: bool,
+    /// Keep spot tint images (grayscale image + solid spot paint) as-is for X-1a export:
+    /// they are written as /Separation tint images and shouldn't be re-flattened. Not a preset option.
+    #[serde(skip)]
+    pub keeps_spot_tint_images: bool,
+    /// Page bounds (including bleed) to clamp over-cap raster rects. `None` for no clamping.
+    /// Used to prevent rasters from extending far beyond the page. Not a preset option.
+    #[serde(skip)]
+    pub page_bounds: Option<Rect>,
 }
 
 impl Default for FlattenOptions {
@@ -86,6 +94,8 @@ impl FlattenOptions {
             preserve_overprints: true,
             no_transparency: None,
             keeps_colorize: false,
+            keeps_spot_tint_images: false,
+            page_bounds: None,
         }
     }
 
@@ -151,8 +161,10 @@ impl FlattenOptions {
 
     /// Whether colorized image `n`, art of `d`, counts as transparency by itself. With
     /// [`Self::keeps_colorize`], an image colorized with a solid paint whose pixels are grayscale
-    /// or 1-bit doesn't: the EPS writer draws it in that paint. An image whose pixels don't take
-    /// the paint ([`vectorcraft_doc::ImageBlob::takes_colorize`]) never counts: it draws uncolorized.
+    /// or 1-bit doesn't: the EPS writer draws it in that paint. With [`Self::keeps_spot_tint_images`],
+    /// a grayscale image colorized with a solid spot paint doesn't count: it's written as a
+    /// /Separation tint image. An image whose pixels don't take the paint
+    /// ([`vectorcraft_doc::ImageBlob::takes_colorize`]) never counts: it draws uncolorized.
     pub(crate) fn counts_colorize(&self, d: &Document, n: &Node) -> bool {
         let NodeKind::Image(im) = &n.kind else { return true };
         let shown = d.shown_image(n, im);
@@ -160,12 +172,27 @@ impl FlattenOptions {
         if blob.is_some_and(|b| !b.takes_colorize()) {
             return false;
         }
-        let solid = matches!(n.extras().colorize.as_deref(), Some(Paint::Solid { .. }));
-        !self.keeps_colorize || !solid || blob.is_some_and(|b| b.gray_source().is_none())
+        let colorize = n.extras().colorize.as_deref();
+        let solid = matches!(colorize, Some(Paint::Solid { .. }));
+        // For EPS: keeps_colorize allows any solid colorize with grayscale pixels
+        if self.keeps_colorize && solid && blob.is_some_and(|b| b.gray_source().is_some()) {
+            return false;
+        }
+        // For X-1a: keeps_spot_tint_images allows solid spot colorize with grayscale pixels.
+        // Also allows [Registration] which paints every plate.
+        if self.keeps_spot_tint_images {
+            if let Some(Paint::Solid { swatch: Some(name), .. }) = colorize {
+                let is_spot_or_registration = d.spot_names().contains(name) || name == vectorcraft_color::swatch::REGISTRATION;
+                if is_spot_or_registration && blob.is_some_and(|b| b.gray_source().is_some()) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// `n` shows an image whose see-through pixels count as transparency.
-    pub(super) fn draws_see_through_image(&self, n: &Node) -> bool {
+    pub(crate) fn draws_see_through_image(&self, n: &Node) -> bool {
         self.no_transparency.as_ref().is_some_and(|keys| draws_image(n, keys))
     }
 
@@ -180,6 +207,11 @@ impl FlattenOptions {
     pub(crate) fn region_limit(&self) -> Option<usize> {
         (!self.clip_complex_regions && self.balance > 0.0 && self.balance < 100.0).then(|| 10f64.powf(self.balance / 20.0).floor() as usize)
     }
+
+    /// The hard cap on regions per flattened group: krilla's dictionary limit is 4095 entries, and
+    /// each region needs at least one XObject name. We cap at 3900 to leave margin for other
+    /// resources the page may need.
+    pub(crate) const REGION_CAP: usize = 3900;
 }
 
 pub(super) fn flatten(s: &mut Session, p: &Value) -> Result<Value> {

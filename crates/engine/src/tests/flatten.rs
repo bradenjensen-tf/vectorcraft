@@ -355,6 +355,7 @@ fn a_long_rasterized_area_is_placed_whole() {
     let _settings = settings_lock();
     let mut s = session();
     // 5569 pt long: more than the renderer's 32,768 pixels a side at the 64 Mpx limit's scale.
+    // Tiling produces multiple images that together cover the region at full ppi.
     let g = rect(&mut s, 10.0, 10.0, 100.0, 5569.0, "#000000");
     run(
         &mut s,
@@ -363,16 +364,22 @@ fn a_long_rasterized_area_is_placed_whole() {
     );
     run(&mut s, "transparency.set", json!({"ids": [g], "opacity": 40}));
     let (ids, _, rasterized) = flatten(&mut s, json!({"ids": [g], "lineArtPpi": 1200, "gradientPpi": 1200}));
-    assert_eq!(rasterized, 1);
+    assert!(rasterized >= 1, "at least one image tile");
     let mut placed = vec![];
     node(&s, ids[0]).walk(&mut |c| {
         if let NodeKind::Image(im) = &c.kind {
             placed.push((im.height, im.xf.transform_rect_bbox(Rect::new(0.0, 0.0, f64::from(im.width), f64::from(im.height)))));
         }
     });
-    let [(height, b)] = placed[..] else { panic!("one image: {placed:?}") };
-    assert!(height <= vectorcraft_render::MAX_RASTER_SIDE, "{height} pixels");
-    assert!(b.y0 <= 10.0 && b.y1 >= 5579.0, "the image covers the strip: {b:?}");
+    assert!(!placed.is_empty(), "has image tiles: {placed:?}");
+    // Each tile must stay within renderer limits
+    for (height, _) in &placed {
+        assert!(*height <= vectorcraft_render::MAX_RASTER_SIDE, "{height} pixels");
+    }
+    // Tiles together cover the whole strip (union of all tile bounds)
+    let min_y = placed.iter().map(|(_, b)| b.y0).fold(f64::INFINITY, f64::min);
+    let max_y = placed.iter().map(|(_, b)| b.y1).fold(f64::NEG_INFINITY, f64::max);
+    assert!(min_y <= 10.0 && max_y >= 5579.0, "the tiles cover the strip: y0={min_y}, y1={max_y}");
 }
 
 #[test]
@@ -710,4 +717,281 @@ fn opacity_masks_are_rasterized_with_their_look() {
     node(&s, ids[0]).walk(&mut |c| masks += c.extras().mask.is_some() as usize);
     assert_eq!(masks, 0, "no transparency is left");
     assert!(changed(&before, &picture(&s)) < 0.02);
+}
+
+/// Groups that would exceed the region cap are rasterized whole instead: krilla's DICT_LEN (4095)
+/// limits how many XObject names one page can have.
+#[test]
+fn region_cap_prevents_too_many_regions() {
+    use crate::cmd::FlattenOptions;
+    let _settings = settings_lock();
+    let mut s = session();
+    for i in 0..100 {
+        let x = (i % 10) as f64 * 20.0;
+        let y = (i / 10) as f64 * 20.0;
+        rect(&mut s, x, y, 15.0, 15.0, if i % 2 == 0 { "#ff0000" } else { "#0000ff" });
+    }
+    run(&mut s, "select.all", json!({}));
+    run(&mut s, "transparency.set", json!({"opacity": 50}));
+    let (_, vector, _) = flatten(&mut s, json!({"balance": 100}));
+    assert!(vector as usize <= FlattenOptions::REGION_CAP,
+        "vector regions {} should not exceed cap {}", vector, FlattenOptions::REGION_CAP);
+}
+
+/// Over-cap groups (rasterized whole) with no_transparency set must be opaque: they get a clip
+/// (the group outline) so render_raster sets no_alpha.
+#[test]
+fn over_cap_groups_for_no_transparency_are_opaque() {
+    let _settings = settings_lock();
+    let mut s = session();
+    // Create many overlapping shapes to exceed REGION_CAP.
+    for i in 0..150 {
+        let x = (i % 15) as f64 * 12.0;
+        let y = (i / 15) as f64 * 18.0;
+        rect(&mut s, x, y, 20.0, 25.0, if i % 2 == 0 { "#ff0000" } else { "#0000ff" });
+    }
+    // Add a semi-transparent image in the middle.
+    let alpha_png = {
+        let img = image::RgbaImage::from_pixel(10, 10, image::Rgba([128, 64, 32, 180]));
+        let mut out = std::io::Cursor::new(vec![]);
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    };
+    run(&mut s, "file.place", json!({"name": "alpha.png", "dataBase64": vectorcraft_format::base64_encode(&alpha_png), "at": [80, 80]}));
+    run(&mut s, "select.all", json!({}));
+    run(&mut s, "transparency.set", json!({"opacity": 90}));
+    // Flatten with no_transparency (simulating PDF/X-1a).
+    let (ids, _, rasterized) = flatten(&mut s, json!({"balance": 100, "noTransparency": true}));
+    assert!(rasterized >= 1, "should rasterize the over-cap group");
+    // The rasterized image must be opaque (no shows_transparency).
+    for id in ids {
+        let n = node(&s, id);
+        assert!(!n.shows_transparency(), "flattened group {id} should be opaque");
+    }
+}
+
+/// Multiple overlapping transparent groups at the layer level must all be flattened for
+/// no-transparency output.
+#[test]
+fn multi_group_flattens_all_for_no_transparency() {
+    let _settings = settings_lock();
+    let mut s = session();
+    // Create multiple separate groups of overlapping transparent shapes.
+    for group_idx in 0..3 {
+        let base_x = group_idx as f64 * 60.0;
+        // Create overlapping transparent shapes.
+        for i in 0..6 {
+            let x = base_x + (i % 3) as f64 * 12.0;
+            let y = (i / 3) as f64 * 12.0 + 10.0;
+            let id = rect(&mut s, x, y, 20.0, 20.0, if i % 2 == 0 { "#ff0000" } else { "#00ff00" });
+            run(&mut s, "select.set", json!({"ids": [id]}));
+            run(&mut s, "transparency.set", json!({"opacity": 50 + group_idx * 10, "blendMode": "multiply"}));
+        }
+    }
+    run(&mut s, "select.all", json!({}));
+    // Flatten with no_transparency.
+    let (ids, _, _) = flatten(&mut s, json!({"noTransparency": true}));
+    // No node should show transparency after flattening.
+    for id in ids {
+        let n = node(&s, id);
+        assert!(!n.shows_transparency(), "flattened group {id} should be opaque");
+    }
+}
+
+/// An over-cap group with shapes of opposite winding must not punch holes in the flattened result.
+/// The clip should be a proper union, not concatenated subpaths that cancel under nonzero fill.
+#[test]
+fn over_cap_union_clip_covers_opposite_winding_shapes() {
+    let _settings = settings_lock();
+    let mut s = session();
+    // Create a large outer square.
+    let outer_id = rect(&mut s, 10.0, 10.0, 180.0, 180.0, "#00ff00");
+    // Create a smaller inner square with opposite winding by reversing its path.
+    let inner_id = rect(&mut s, 50.0, 50.0, 100.0, 100.0, "#ff0000");
+    // Reverse the inner path to create opposite winding.
+    run(&mut s, "path.reverse", json!({"ids": [inner_id]}));
+    // Apply transparency to both shapes.
+    run(&mut s, "transparency.set", json!({"ids": [outer_id], "opacity": 80}));
+    run(&mut s, "transparency.set", json!({"ids": [inner_id], "opacity": 80, "blendMode": "multiply"}));
+    // Flatten with no_transparency and balance=0 to force over-cap rasterization.
+    run(&mut s, "select.all", json!({}));
+    let (ids, _, rasterized) = flatten(&mut s, json!({"balance": 0, "noTransparency": true}));
+    assert!(rasterized >= 1, "should have rasterized the group");
+    // The flattened image must be opaque.
+    for id in ids {
+        let n = node(&s, id);
+        assert!(!n.shows_transparency(), "flattened node {id} should be opaque");
+    }
+    // Verify via the image: the inner square area should NOT be white (no hole).
+    // Export as PNG and check center pixel.
+    let png = run(&mut s, "document.export", json!({"format": "png", "ppi": 72}));
+    let data = vectorcraft_format::base64_decode(png["dataBase64"].as_str().unwrap()).unwrap();
+    let img = image::load_from_memory(&data).unwrap().into_rgba8();
+    // Check center of inner square (100, 100 in a 200x200 doc).
+    let (cx, cy) = (100, 100);
+    let pixel = img.get_pixel(cx, cy);
+    // The pixel should NOT be white/near-white (would indicate a hole).
+    let is_white = pixel.0[0] > 240 && pixel.0[1] > 240 && pixel.0[2] > 240;
+    assert!(!is_white, "center pixel should not be white (hole in clip): {:?}", pixel.0);
+    // And should have some color (not transparent).
+    assert!(pixel.0[3] > 200, "center pixel should be opaque: alpha={}", pixel.0[3]);
+}
+
+// --- Spot ink preservation tests ---
+
+/// Helper to create a CMYK document with a spot swatch.
+fn cmyk_session_with_spot(spot_name: &str, cmyk: [f32; 4]) -> Session {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 200, "height": 200, "colorMode": "cmyk"})).unwrap();
+    // Add a spot swatch using swatch.new.
+    s.execute("swatch.new", &json!({
+        "name": spot_name,
+        "spot": true,
+        "color": {"c": cmyk[0], "m": cmyk[1], "y": cmyk[2], "k": cmyk[3]}
+    })).unwrap();
+    s
+}
+
+/// A spot-filled shape under a transparent overlay gets a spot tint image in the flattened result.
+/// The colorize mechanism ensures the PDF exporter writes it in a Separation colorspace.
+#[test]
+fn spot_under_transparent_overlay_creates_spot_image() {
+    let _settings = settings_lock();
+    let mut s = cmyk_session_with_spot("Gold", [0.0, 0.2, 0.8, 0.1]);
+    
+    // Create a spot-filled rectangle.
+    let spot_id = run(&mut s, "shape.rectangle", json!({"x": 20.0, "y": 20.0, "width": 60.0, "height": 60.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [spot_id], "swatch": "Gold"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [spot_id], "none": true}));
+    
+    // Create a semi-transparent overlay above it.
+    let overlay_id = run(&mut s, "shape.rectangle", json!({"x": 40.0, "y": 40.0, "width": 60.0, "height": 60.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overlay_id], "color": "#ff0000"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overlay_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [overlay_id], "opacity": 50}));
+    
+    run(&mut s, "select.all", json!({}));
+    
+    // Use flatten_document directly with proper no_transparency option.
+    // The JSON command doesn't expose no_transparency - it's set internally for PDF/X export.
+    let doc = &s.doc().unwrap().doc;
+    let mut options = crate::cmd::flatten::FlattenOptions::preset("low").unwrap();
+    options.no_transparency = Some(Default::default());
+    options.clip_complex_regions = true;
+    options.balance = 0.0;
+    let flat = crate::cmd::flatten::flatten_document(doc, &options).unwrap().unwrap();
+    
+    // Verify spot images are created by checking for colorized images.
+    let mut total_images = 0;
+    let mut colorized_images = 0;
+    flat.walk(|c| {
+        if let NodeKind::Image(_) = &c.kind {
+            total_images += 1;
+            if c.extras().colorize.is_some() {
+                colorized_images += 1;
+            }
+        }
+    });
+    // With no_transparency and clipComplexRegions, we should get spot tint images.
+    assert!(total_images >= 1, "should have at least one image in flattened result, got {}", total_images);
+    assert!(colorized_images >= 1, "should have colorized spot image(s), got {} colorized of {} total", colorized_images, total_images);
+}
+
+/// A spot with multiply blend and partial opacity over process colors creates a spot tint image.
+/// The opacity ensures flattening is required.
+#[test]
+fn spot_multiply_blend_creates_spot_image() {
+    let _settings = settings_lock();
+    let mut s = cmyk_session_with_spot("Silver", [0.1, 0.1, 0.1, 0.3]);
+    
+    // Create a cyan base rectangle with some opacity to trigger flattening.
+    let base_id = run(&mut s, "shape.rectangle", json!({"x": 20.0, "y": 20.0, "width": 80.0, "height": 80.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [base_id], "color": {"c": 1.0, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [base_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [base_id], "opacity": 90}));
+    
+    // Create a spot-filled rectangle with multiply blend overlapping the base.
+    let spot_id = run(&mut s, "shape.rectangle", json!({"x": 40.0, "y": 40.0, "width": 80.0, "height": 80.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [spot_id], "swatch": "Silver"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [spot_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [spot_id], "blendMode": "multiply", "opacity": 80}));
+    
+    run(&mut s, "select.all", json!({}));
+    
+    // Use flatten_document directly with proper no_transparency option.
+    let doc = &s.doc().unwrap().doc;
+    let mut options = crate::cmd::flatten::FlattenOptions::preset("low").unwrap();
+    options.no_transparency = Some(Default::default());
+    options.clip_complex_regions = true;
+    options.balance = 0.0;
+    let flat = crate::cmd::flatten::flatten_document(doc, &options).unwrap().unwrap();
+    
+    // Count total images and colorized images in the output.
+    let mut total_images = 0;
+    let mut colorized_images = 0;
+    flat.walk(|c| {
+        if let NodeKind::Image(_) = &c.kind {
+            total_images += 1;
+            if c.extras().colorize.is_some() {
+                colorized_images += 1;
+            }
+        }
+    });
+    assert!(total_images >= 1, "should have at least one image in flattened result");
+    assert!(colorized_images >= 1, "should have colorized spot image(s), got {} colorized of {} total", colorized_images, total_images);
+}
+
+/// Two overlapping spots with opacity each get their own spot tint image.
+#[test]
+fn two_spots_overlapping_with_opacity_create_separate_images() {
+    let _settings = settings_lock();
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 200, "height": 200, "colorMode": "cmyk"})).unwrap();
+    
+    // Add two spot swatches using swatch.new.
+    s.execute("swatch.new", &json!({
+        "name": "PantoneRed",
+        "spot": true,
+        "color": {"c": 0.0, "m": 1.0, "y": 1.0, "k": 0.0}
+    })).unwrap();
+    s.execute("swatch.new", &json!({
+        "name": "PantoneBlue",
+        "spot": true,
+        "color": {"c": 1.0, "m": 0.5, "y": 0.0, "k": 0.0}
+    })).unwrap();
+    
+    // Create two overlapping spot rectangles with opacity.
+    let red_id = run(&mut s, "shape.rectangle", json!({"x": 20.0, "y": 20.0, "width": 80.0, "height": 80.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [red_id], "swatch": "PantoneRed"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [red_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [red_id], "opacity": 70}));
+    
+    let blue_id = run(&mut s, "shape.rectangle", json!({"x": 60.0, "y": 60.0, "width": 80.0, "height": 80.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [blue_id], "swatch": "PantoneBlue"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [blue_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [blue_id], "opacity": 70}));
+    
+    run(&mut s, "select.all", json!({}));
+    let _before = picture(&s);
+    
+    // Use flatten_document directly with proper no_transparency option.
+    let doc = &s.doc().unwrap().doc;
+    let mut options = crate::cmd::flatten::FlattenOptions::preset("low").unwrap();
+    options.no_transparency = Some(Default::default());
+    options.clip_complex_regions = true;
+    options.balance = 0.0;
+    let flat = crate::cmd::flatten::flatten_document(doc, &options).unwrap().unwrap();
+    
+    // Count colorized images - should have one for each spot ink used.
+    let mut spot_names = std::collections::HashSet::new();
+    flat.walk(|c| {
+        if let NodeKind::Image(_) = &c.kind {
+            if let Some(paint) = c.extras().colorize.as_deref() {
+                if let Paint::Solid { swatch: Some(name), .. } = paint {
+                    spot_names.insert(name.clone());
+                }
+            }
+        }
+    });
+    assert!(spot_names.len() >= 2, "should have spot images for both inks: {:?}", spot_names);
 }

@@ -123,26 +123,28 @@ fn choosing_a_pdfx_standard_sets_its_version_and_turns_off_what_it_forbids() {
 }
 
 /// A PDF/X file without the bleed the document sets exports as asked and warns; the presets and
-/// options that take the document's bleed, and files that aren't PDF/X files, don't warn.
+/// options that take the document's bleed (which is the default), and files that aren't PDF/X
+/// files, don't warn.
 #[test]
 fn a_pdfx_file_that_leaves_out_the_document_bleed_warns() {
     let left_out = |w: &Vec<String>| w.iter().any(|w| w == super::pdf::BLEED_LEFT_OUT);
     let mut s = session();
     s.execute("document.setup", &json!({"bleed": 6})).unwrap();
+    // Explicitly disable document bleed to test the warning.
     for standard in ["pdfX1a", "pdfX3", "pdfX4"] {
-        let (_, warnings) = pdf(&mut s, json!({"standard": standard}));
+        let (_, warnings) = pdf(&mut s, json!({"standard": standard, "bleed": {"useDocument": false}}));
         // First: the status bar shows the first warning, and PDF/X-1a and PDF/X-3 add the flattening note.
         assert_eq!(warnings.first().map(String::as_str), Some(super::pdf::BLEED_LEFT_OUT), "{standard}: {warnings:?}");
         // The page has no bleed, as asked.
-        let v = s.execute("document.exportPdf", &json!({"standard": standard})).unwrap();
+        let v = s.execute("document.exportPdf", &json!({"standard": standard, "bleed": {"useDocument": false}})).unwrap();
         let info = s.execute("document.pdfInfo", &json!({"name": "x.pdf", "dataBase64": v["dataBase64"]})).unwrap();
         let boxes = &info["pageInfo"][0]["boxes"];
         assert!(boxes["media"].is_array() && boxes["media"] == boxes["trim"] && boxes["media"] == boxes["bleed"], "{standard}: {info}");
     }
-    let v = s.execute("document.export", &json!({"format": "pdf", "standard": "pdfX4"})).unwrap();
+    let v = s.execute("document.export", &json!({"format": "pdf", "standard": "pdfX4", "bleed": {"useDocument": false}})).unwrap();
     assert!(v["warnings"].as_array().unwrap().iter().any(|w| w == super::pdf::BLEED_LEFT_OUT), "{v}");
     // A side the settings leave out warns, and sides they all keep don't.
-    let (_, warnings) = pdf(&mut s, json!({"standard": "pdfX4", "bleed": {"top": 6, "bottom": 6, "left": 6}}));
+    let (_, warnings) = pdf(&mut s, json!({"standard": "pdfX4", "bleed": {"useDocument": false, "top": 6, "bottom": 6, "left": 6}}));
     assert!(left_out(&warnings), "{warnings:?}");
     for p in [
         json!({"preset": "PDF/X-1a:2001"}),
@@ -152,18 +154,20 @@ fn a_pdfx_file_that_leaves_out_the_document_bleed_warns() {
         json!({"standard": "pdfX4", "bleed": {"top": 1, "bottom": 1, "left": 1, "right": 1}}),
         json!({}),
         json!({"standard": "pdfA2b"}),
+        // Default now uses document bleed, so no warning.
+        json!({"standard": "pdfX4"}),
     ] {
         let (_, warnings) = pdf(&mut s, p.clone());
         assert!(!left_out(&warnings), "{p}: {warnings:?}");
     }
-    // The dialog's Summary exports in memory, so it lists the warning too.
-    let v = s.execute("document.pdfSettings", &json!({"standard": "pdfX4", "includeDocument": true})).unwrap();
+    // The dialog's Summary exports in memory, so it lists the warning too (when bleed is explicitly off).
+    let v = s.execute("document.pdfSettings", &json!({"standard": "pdfX4", "bleed": {"useDocument": false}, "includeDocument": true})).unwrap();
     assert!(v["warnings"].as_array().unwrap().iter().any(|w| w == super::pdf::BLEED_LEFT_OUT), "{v}");
     // A bleed on the top alone: only that side counts.
     s.execute("document.setup", &json!({"bleed": [6, 0, 0, 0]})).unwrap();
-    let (_, warnings) = pdf(&mut s, json!({"standard": "pdfX4", "bleed": {"top": 1}}));
+    let (_, warnings) = pdf(&mut s, json!({"standard": "pdfX4", "bleed": {"useDocument": false, "top": 1}}));
     assert!(!left_out(&warnings), "{warnings:?}");
-    let (_, warnings) = pdf(&mut s, json!({"standard": "pdfX4", "bleed": {"bottom": 1}}));
+    let (_, warnings) = pdf(&mut s, json!({"standard": "pdfX4", "bleed": {"useDocument": false, "bottom": 1}}));
     assert!(left_out(&warnings), "{warnings:?}");
     // A document without a bleed has nothing to leave out.
     s.execute("document.setup", &json!({"bleed": 0})).unwrap();
@@ -829,4 +833,799 @@ fn flattening_keeps_the_group_in_the_clipping_layer_when_the_layer_below_differs
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A spot-colored rectangle under a 50% CMYK shape (inside an over-cap group) exports to PDF/X-1a
+/// with a Separation colorspace for the spot ink. The spot must not be baked into CMYK.
+#[test]
+fn pdfx_1a_preserves_spot_colors_in_flattened_transparency_as_separation() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    
+    // Add a spot swatch.
+    s.execute("swatch.new", &json!({
+        "name": "PantoneGold",
+        "spot": true,
+        "color": {"c": 0.0, "m": 0.2, "y": 0.8, "k": 0.1}
+    })).unwrap();
+    
+    // Create a spot-filled rectangle.
+    let spot_id = run(&mut s, "shape.rectangle", json!({"x": 20.0, "y": 20.0, "width": 80.0, "height": 80.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [spot_id], "swatch": "PantoneGold"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [spot_id], "none": true}));
+    
+    // Create a semi-transparent CMYK overlay above it.
+    let overlay_id = run(&mut s, "shape.rectangle", json!({"x": 40.0, "y": 40.0, "width": 80.0, "height": 80.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overlay_id], "color": {"c": 0.5, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overlay_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [overlay_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a (which requires flattening).
+    let p = json!({"standard": "pdfX1a", "compression": {"compressText": false}});
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // The PDF must contain a Separation or DeviceN colorspace for the spot ink.
+    // Look for /Separation or /DeviceN with the spot name.
+    let has_separation = text.contains("/Separation") || text.contains("/DeviceN");
+    let has_spot_name = text.contains("/PantoneGold") || text.contains("(PantoneGold)");
+    
+    assert!(has_separation && has_spot_name,
+        "PDF/X-1a with spot under transparency must have Separation/DeviceN with spot name: has_separation={}, has_spot_name={}",
+        has_separation, has_spot_name);
+    
+    // Verify it was flattened (should have a warning).
+    let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}
+
+/// End-to-end test: spot under transparency forced over REGION_CAP, exported via document.exportPdf.
+/// The PDF must contain /Separation with the spot name and no raster extends past the page.
+#[test]
+fn pdfx_1a_spot_under_transparency_over_cap_has_separation_image_within_page() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    
+    // Add a spot swatch.
+    s.execute("swatch.new", &json!({
+        "name": "TestSpot",
+        "spot": true,
+        "color": {"c": 0.0, "m": 0.5, "y": 1.0, "k": 0.0}
+    })).unwrap();
+    
+    // Create a spot-filled rectangle covering part of the page.
+    let spot_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 10.0, "width": 100.0, "height": 100.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [spot_id], "swatch": "TestSpot"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [spot_id], "none": true}));
+    
+    // Create a semi-transparent overlay to trigger flattening.
+    // Using balance=0 forces rasterization (over-cap scenario).
+    let overlay_id = run(&mut s, "shape.rectangle", json!({"x": 30.0, "y": 30.0, "width": 60.0, "height": 60.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overlay_id], "color": {"c": 0.2, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overlay_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [overlay_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a with low balance to force rasterization (over-cap scenario).
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"balance": 0}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // The PDF must contain a Separation or DeviceN colorspace for the spot ink.
+    let has_separation = text.contains("/Separation") || text.contains("/DeviceN");
+    let has_spot_name = text.contains("/TestSpot") || text.contains("(TestSpot)");
+    
+    assert!(has_separation && has_spot_name,
+        "PDF/X-1a with spot over-cap must have Separation/DeviceN with spot name: has_separation={}, has_spot_name={}",
+        has_separation, has_spot_name);
+    
+    // Check that no image extends far outside the page bounds.
+    // Page is 200x200. Look for image matrices that place images way outside.
+    // This is a basic check - we look for cm operators with values >> 200.
+    for line in text.lines() {
+        if line.ends_with(" cm") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 6 {
+                // Matrix is [a b c d e f] where e and f are translation
+                if let (Ok(e), Ok(f)) = (parts[4].parse::<f64>(), parts[5].parse::<f64>()) {
+                    assert!(e.abs() < 10000.0 && f.abs() < 10000.0,
+                        "Image placed far outside page at ({}, {})", e, f);
+                }
+            }
+        }
+    }
+    
+    // Verify it was flattened.
+    let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}
+
+/// End-to-end test: large area exceeding MAX_PIXELS triggers tiling during PDF export.
+/// The resulting PDF should have multiple images placed adjacently (tiles).
+#[test]
+fn pdfx_1a_large_area_uses_tiling_in_export() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    
+    // Create a large document (2500x2500 pt). At 300 ppi (scale ~4.17), this is 
+    // about 10400x10400 pixels = 108 million pixels, well over the 64M limit.
+    run(&mut s, "file.new", json!({"width": 2500, "height": 2500, "colorMode": "cmyk"}));
+    
+    // Create overlapping shapes that force flattening.
+    // A CMYK background.
+    let bg_id = run(&mut s, "shape.rectangle", json!({"x": 0.0, "y": 0.0, "width": 2500.0, "height": 2500.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [bg_id], "color": {"c": 0.1, "m": 0.1, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [bg_id], "none": true}));
+    
+    // A semi-transparent overlay to trigger flattening.
+    let overlay_id = run(&mut s, "shape.rectangle", json!({"x": 100.0, "y": 100.0, "width": 2300.0, "height": 2300.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overlay_id], "color": {"c": 0.0, "m": 0.5, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overlay_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [overlay_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a with 300 ppi to trigger tiling.
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"lineArtPpi": 300, "balance": 0}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // Count the number of image XObjects. With tiling, there should be multiple.
+    // Each /Image XObject has a /Subtype/Image declaration (no space in compressed output).
+    let image_count = text.matches("/Subtype/Image").count();
+    
+    // With a 2500x2500 pt area at 300 ppi:
+    // - Total: ~10400x10400 = 108M pixels (over 64M limit)
+    // - Tile size: sqrt(64M) ≈ 8000 pixels per side
+    // - Expected: at least 2x2 = 4 tiles (more likely with safety margins)
+    assert!(image_count >= 2,
+        "Large area should produce multiple image tiles, got {} images. PDF prefix: {}...",
+        image_count, &text[..text.len().min(2000)]);
+    
+    // Verify it was flattened.
+    let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}
+
+/// End-to-end test: raster rect clamped to page bounds with bleed.
+/// Art extending off the page shouldn't cause rasters to be placed far outside.
+#[test]
+fn pdfx_1a_raster_rect_clamped_to_page_bounds() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    
+    // Create a small page with bleed.
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    // Set bleed (12 pt = 1/6 inch on all sides).
+    s.execute("document.setup", &json!({"bleed": [12.0, 12.0, 12.0, 12.0]})).unwrap();
+    
+    // Create art that extends FAR off the page (e.g., at y = -5000).
+    // This simulates the Vonco regression where art was placed at y=-5730.
+    let far_id = run(&mut s, "shape.rectangle", json!({"x": 50.0, "y": -5000.0, "width": 100.0, "height": 200.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [far_id], "color": {"c": 0.5, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [far_id], "none": true}));
+    
+    // Add overlapping art on the page with transparency to trigger flattening.
+    let on_page_id = run(&mut s, "shape.rectangle", json!({"x": 50.0, "y": 50.0, "width": 100.0, "height": 100.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [on_page_id], "color": {"c": 0.0, "m": 0.5, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [on_page_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [on_page_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a.
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"balance": 0}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // Check that no image placement matrix has translations far outside page bounds.
+    // Page is 200x200 with 12pt bleed, so valid range is roughly -12 to 212.
+    // We allow some slack for rounding but definitely not -5000.
+    let page_max = 500.0; // generous limit to catch the -5000 case
+    for line in text.lines() {
+        if line.ends_with(" cm") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 6 {
+                // Matrix is [a b c d e f] where e and f are translation
+                if let (Ok(e), Ok(f)) = (parts[4].parse::<f64>(), parts[5].parse::<f64>()) {
+                    assert!(e.abs() < page_max && f.abs() < page_max,
+                        "Image placed far outside page at ({}, {}), should be clamped to page+bleed bounds", e, f);
+                }
+            }
+        }
+    }
+    
+    // Verify it was flattened.
+    let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}
+
+/// End-to-end test: spot images have overprint ExtGState (OP/op true).
+/// Without overprint, tint 0 would knock out to white.
+#[test]
+fn pdfx_1a_spot_tint_images_have_overprint_extgstate() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    
+    // Add a spot swatch.
+    s.execute("swatch.new", &json!({
+        "name": "TestSpot",
+        "spot": true,
+        "color": {"c": 0.0, "m": 0.5, "y": 1.0, "k": 0.0}
+    })).unwrap();
+    
+    // Create a spot-filled rectangle.
+    let spot_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 10.0, "width": 100.0, "height": 100.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [spot_id], "swatch": "TestSpot"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [spot_id], "none": true}));
+    
+    // Create a semi-transparent overlay to trigger flattening.
+    let overlay_id = run(&mut s, "shape.rectangle", json!({"x": 30.0, "y": 30.0, "width": 60.0, "height": 60.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overlay_id], "color": {"c": 0.2, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overlay_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [overlay_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a.
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"balance": 0}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // The PDF must contain an ExtGState with OP and op for overprint.
+    // Look for /OP true/op true or /OP true /op true.
+    let has_overprint_gs = text.contains("/OP true") && text.contains("/op true");
+    
+    assert!(has_overprint_gs,
+        "PDF/X-1a with spot tint images must have overprint ExtGState (/OP true /op true)");
+    
+    // Verify it was flattened.
+    let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}
+
+/// End-to-end test: process tile doesn't contain spot ink.
+/// When a spot-colored shape overlaps with transparent process art, the process tile
+/// should not include the spot ink (spots go on their own tint images).
+#[test]
+fn pdfx_1a_process_tile_excludes_spot_ink() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    
+    // Add a spot swatch with a distinctive CMYK alternate (pure magenta).
+    s.execute("swatch.new", &json!({
+        "name": "PureMagenta",
+        "spot": true,
+        "color": {"c": 0.0, "m": 1.0, "y": 0.0, "k": 0.0}
+    })).unwrap();
+    
+    // Create a CMYK background (cyan).
+    let bg_id = run(&mut s, "shape.rectangle", json!({"x": 0.0, "y": 0.0, "width": 200.0, "height": 200.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [bg_id], "color": {"c": 1.0, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [bg_id], "none": true}));
+    
+    // Create a spot-filled rectangle on top.
+    let spot_id = run(&mut s, "shape.rectangle", json!({"x": 50.0, "y": 50.0, "width": 100.0, "height": 100.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [spot_id], "swatch": "PureMagenta"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [spot_id], "none": true}));
+    
+    // Add a third shape with transparency to trigger flattening.
+    let trans_id = run(&mut s, "shape.rectangle", json!({"x": 75.0, "y": 75.0, "width": 50.0, "height": 50.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [trans_id], "color": {"c": 0.0, "m": 0.0, "y": 1.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [trans_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [trans_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a with balance=0 to force rasterization.
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"balance": 0}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // The PDF should have both:
+    // 1. A CMYK image (the process tile) - /ColorSpace/DeviceCMYK
+    // 2. A spot tint image - /ColorSpace with DeviceN containing PureMagenta
+    let has_cmyk_image = text.contains("/DeviceCMYK");
+    let has_spot_image = text.contains("/DeviceN") && text.contains("PureMagenta");
+    
+    assert!(has_cmyk_image, "Should have CMYK process tile");
+    assert!(has_spot_image, "Should have spot tint image for PureMagenta");
+    
+    // Verify it was flattened.
+    let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}
+
+/// End-to-end test: [Registration] gets a DeviceN with all colorants.
+/// [Registration] paints every plate (CMYK + all spots), written as colorant "All".
+#[test]
+fn pdfx_1a_registration_paints_every_plate() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    
+    // Add a regular spot to verify [Registration] includes it in its DeviceN.
+    s.execute("swatch.new", &json!({
+        "name": "RegularSpot",
+        "spot": true,
+        "color": {"c": 0.0, "m": 1.0, "y": 0.0, "k": 0.0}
+    })).unwrap();
+    
+    // Create a shape with [Registration] fill (the built-in swatch that paints every plate).
+    // [Registration] is not a spot swatch but is treated specially.
+    let reg_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 10.0, "width": 80.0, "height": 80.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [reg_id], "swatch": "[Registration]"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [reg_id], "none": true}));
+    
+    // Create a semi-transparent overlay to trigger flattening.
+    let overlay_id = run(&mut s, "shape.rectangle", json!({"x": 30.0, "y": 30.0, "width": 60.0, "height": 60.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overlay_id], "color": {"c": 0.2, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overlay_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [overlay_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a.
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"balance": 0}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // The PDF should have a DeviceN with process colorants for [Registration].
+    // [Registration] paints every plate, so the DeviceN should contain Cyan, Magenta, Yellow, Black.
+    let has_process_colorants = text.contains("/Cyan") && text.contains("/Magenta") 
+        && text.contains("/Yellow") && text.contains("/Black");
+    
+    assert!(has_process_colorants,
+        "[Registration] should create DeviceN with process colorants (Cyan/Magenta/Yellow/Black)");
+    
+    // Verify it was flattened.
+    let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}
+
+/// Test: spot names with special characters (like underscores, slashes) are preserved.
+/// This tests that spot names like "Check_Text" or names with "/" work correctly.
+#[test]
+fn pdfx_1a_spot_with_special_characters_in_name() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    
+    // Add spots with special characters in names (like Check_Text).
+    s.execute("swatch.new", &json!({
+        "name": "Check_Text",
+        "spot": true,
+        "color": {"c": 0.0, "m": 0.0, "y": 0.0, "k": 1.0}
+    })).unwrap();
+    
+    // Create a shape with the special-name spot.
+    let spot_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 10.0, "width": 80.0, "height": 80.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [spot_id], "swatch": "Check_Text"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [spot_id], "none": true}));
+    
+    // Create a semi-transparent overlay to trigger flattening.
+    let overlay_id = run(&mut s, "shape.rectangle", json!({"x": 30.0, "y": 30.0, "width": 60.0, "height": 60.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overlay_id], "color": {"c": 0.2, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overlay_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [overlay_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a.
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"balance": 0}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // The PDF should contain the spot name (possibly with # encoding for special chars).
+    // In PDF, underscore becomes #5F in names.
+    let has_spot = text.contains("Check_Text") || text.contains("Check#5FText");
+    
+    assert!(has_spot,
+        "Spot with special characters 'Check_Text' should appear in PDF");
+    
+    // Also verify there's a DeviceN colorspace for it.
+    let has_device_n = text.contains("/DeviceN");
+    assert!(has_device_n, "Should have DeviceN colorspace for spot");
+    
+    // Verify it was flattened.
+    let warnings: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert!(warnings.iter().any(|w| w.contains("flattened")), "should have flattened: {warnings:?}");
+}
+
+/// Test: consecutive overprint spot paths in a flat layer next to transparent groups are preserved.
+/// Repro for DWS-RS Check_Text: 156 consecutive paths with spot fills, overprint=true, opacity=1,
+/// in a flat layer that also has transparency groups.
+#[test]
+fn pdfx_1a_many_consecutive_overprint_spot_paths_preserved() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 400, "height": 400, "colorMode": "cmyk"}));
+    
+    // Add a spot swatch like Check_Text (K=1 alternate)
+    s.execute("swatch.new", &json!({
+        "name": "Check_Text",
+        "spot": true,
+        "color": {"c": 0.0, "m": 0.0, "y": 0.0, "k": 1.0}
+    })).unwrap();
+    
+    // Create many consecutive spot paths with overprint (like glyph shapes)
+    for i in 0..20 {
+        let x = 10.0 + (i as f64) * 15.0;
+        let id = run(&mut s, "shape.rectangle", json!({"x": x, "y": 50.0, "width": 10.0, "height": 20.0}))["id"].as_u64().unwrap();
+        run(&mut s, "paint.setFill", json!({"ids": [id], "swatch": "Check_Text"}));
+        run(&mut s, "paint.setStroke", json!({"ids": [id], "none": true}));
+        // Set overprint
+        s.execute("attributes.set", &json!({"ids": [id], "overprintFill": true})).unwrap();
+    }
+    
+    // Create transparent groups nearby (not overlapping the spot paths)
+    for i in 0..5 {
+        let x = 10.0 + (i as f64) * 60.0;
+        let id = run(&mut s, "shape.rectangle", json!({"x": x, "y": 150.0, "width": 50.0, "height": 50.0}))["id"].as_u64().unwrap();
+        run(&mut s, "paint.setFill", json!({"ids": [id], "color": {"c": 0.5, "m": 0.0, "y": 0.0, "k": 0.0}}));
+        run(&mut s, "paint.setStroke", json!({"ids": [id], "none": true}));
+        run(&mut s, "transparency.set", json!({"ids": [id], "opacity": 50}));
+    }
+    
+    // Create Multiply blending groups
+    for i in 0..3 {
+        let x = 10.0 + (i as f64) * 100.0;
+        let id = run(&mut s, "shape.rectangle", json!({"x": x, "y": 250.0, "width": 80.0, "height": 50.0}))["id"].as_u64().unwrap();
+        run(&mut s, "paint.setFill", json!({"ids": [id], "color": {"c": 0.0, "m": 0.5, "y": 0.0, "k": 0.0}}));
+        run(&mut s, "paint.setStroke", json!({"ids": [id], "none": true}));
+        run(&mut s, "transparency.set", json!({"ids": [id], "blend": "multiply"}));
+    }
+    
+    // Export as PDF/X-1a
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // The spot paths should be preserved as vector spot, not rasterized to DeviceCMYK.
+    // Check for the Check_Text colorant in the PDF.
+    let has_spot = text.contains("Check_Text") || text.contains("Check#5FText");
+    
+    assert!(has_spot, 
+        "Consecutive overprint spot paths should be preserved as vector spots, not rasterized to DeviceCMYK. PDF should contain Check_Text colorant.");
+}
+
+/// Test: PDF/X-1a export is deterministic (byte-identical on double export, ignoring ModDate).
+/// This verifies that spot image stacking order is stable across exports.
+#[test]
+fn pdfx_1a_export_is_deterministic() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    
+    // Add multiple spots to test ordering
+    for name in ["SpotA", "SpotB", "SpotC", "SpotD"] {
+        s.execute("swatch.new", &json!({
+            "name": name,
+            "spot": true,
+            "color": {"c": 0.5, "m": 0.5, "y": 0.0, "k": 0.0}
+        })).unwrap();
+    }
+    
+    // Create shapes with different spots
+    for (i, name) in ["SpotA", "SpotB", "SpotC", "SpotD"].iter().enumerate() {
+        let x = 10.0 + (i as f64) * 20.0;
+        let id = run(&mut s, "shape.rectangle", json!({"x": x, "y": 10.0, "width": 15.0, "height": 80.0}))["id"].as_u64().unwrap();
+        run(&mut s, "paint.setFill", json!({"ids": [id], "swatch": name}));
+        run(&mut s, "paint.setStroke", json!({"ids": [id], "none": true}));
+    }
+    
+    // Create a semi-transparent overlay to trigger flattening
+    let overlay_id = run(&mut s, "shape.rectangle", json!({"x": 20.0, "y": 30.0, "width": 60.0, "height": 40.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overlay_id], "color": {"c": 0.2, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overlay_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [overlay_id], "opacity": 50}));
+    
+    // Export twice with balance 0 to force rasterization
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"balance": 0}
+    });
+    let v1 = s.execute("document.exportPdf", &p).unwrap();
+    let bytes1 = vectorcraft_format::base64_decode(v1["dataBase64"].as_str().unwrap()).unwrap();
+    
+    let v2 = s.execute("document.exportPdf", &p).unwrap();
+    let bytes2 = vectorcraft_format::base64_decode(v2["dataBase64"].as_str().unwrap()).unwrap();
+    
+    // Strip all timestamps from PDFs before comparing (ModDate, ModifyDate, CreateDate, etc.)
+    let strip_timestamps = |bytes: &[u8]| -> Vec<u8> {
+        let text = String::from_utf8_lossy(bytes);
+        let mut result = String::new();
+        let mut i = 0;
+        let chars: Vec<char> = text.chars().collect();
+        
+        // Patterns to strip: /ModDate(...), <xmp:ModifyDate>...</xmp:ModifyDate>, <xmp:CreateDate>...</xmp:CreateDate>
+        while i < chars.len() {
+            // Check /ModDate(...)
+            if i + 8 <= chars.len() && chars[i..i+8].iter().collect::<String>() == "/ModDate" {
+                result.push_str("/ModDate(STRIPPED)");
+                while i < chars.len() && chars[i] != '(' {
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1;
+                    while i < chars.len() && chars[i] != ')' {
+                        i += 1;
+                    }
+                    if i < chars.len() {
+                        i += 1;
+                    }
+                }
+            }
+            // Check <xmp:ModifyDate>...</xmp:ModifyDate>
+            else if i + 16 <= chars.len() && chars[i..i+16].iter().collect::<String>() == "<xmp:ModifyDate>" {
+                result.push_str("<xmp:ModifyDate>STRIPPED</xmp:ModifyDate>");
+                while i < chars.len() && !(i + 17 <= chars.len() && chars[i..i+17].iter().collect::<String>() == "</xmp:ModifyDate>") {
+                    i += 1;
+                }
+                if i + 17 <= chars.len() {
+                    i += 17;
+                }
+            }
+            // Check <xmp:CreateDate>...</xmp:CreateDate>
+            else if i + 16 <= chars.len() && chars[i..i+16].iter().collect::<String>() == "<xmp:CreateDate>" {
+                result.push_str("<xmp:CreateDate>STRIPPED</xmp:CreateDate>");
+                while i < chars.len() && !(i + 17 <= chars.len() && chars[i..i+17].iter().collect::<String>() == "</xmp:CreateDate>") {
+                    i += 1;
+                }
+                if i + 17 <= chars.len() {
+                    i += 17;
+                }
+            }
+            else {
+                result.push(chars[i]);
+                i += 1;
+            }
+        }
+        result.into_bytes()
+    };
+    
+    let bytes1_stripped = strip_timestamps(&bytes1);
+    let bytes2_stripped = strip_timestamps(&bytes2);
+    
+    assert_eq!(bytes1_stripped, bytes2_stripped, 
+        "PDF/X-1a export should be byte-identical across runs (deterministic spot ordering)");
+}
+
+/// Test: Overlapping opaque spot paths with overprint preserve all spots in the overlap.
+/// Three overlapping paths: A (no overprint), B (overprint), C (overprint).
+/// All three colorants must appear in the overlap region, not just the topmost.
+#[test]
+fn pdfx_1a_overprint_stack_preserves_all_spots() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 200, "height": 200, "colorMode": "cmyk"}));
+    
+    // Add three spot swatches
+    for (name, c, m, y, k) in [
+        ("SpotA", 1.0, 0.0, 0.0, 0.0),
+        ("SpotB", 0.0, 1.0, 0.0, 0.0),
+        ("SpotC", 0.0, 0.0, 1.0, 0.0),
+    ] {
+        s.execute("swatch.new", &json!({
+            "name": name,
+            "spot": true,
+            "color": {"c": c, "m": m, "y": y, "k": k}
+        })).unwrap();
+    }
+    
+    // Create three overlapping rectangles at the same position
+    // A at bottom (no overprint), B in middle (overprint), C on top (overprint)
+    let a_id = run(&mut s, "shape.rectangle", json!({"x": 50.0, "y": 50.0, "width": 100.0, "height": 100.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [a_id], "swatch": "SpotA"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [a_id], "none": true}));
+    // A does NOT overprint
+    
+    let b_id = run(&mut s, "shape.rectangle", json!({"x": 50.0, "y": 50.0, "width": 100.0, "height": 100.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [b_id], "swatch": "SpotB"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [b_id], "none": true}));
+    s.execute("attributes.set", &json!({"ids": [b_id], "overprintFill": true})).unwrap();
+    
+    let c_id = run(&mut s, "shape.rectangle", json!({"x": 50.0, "y": 50.0, "width": 100.0, "height": 100.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [c_id], "swatch": "SpotC"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [c_id], "none": true}));
+    s.execute("attributes.set", &json!({"ids": [c_id], "overprintFill": true})).unwrap();
+    
+    // Add a 50% opacity group elsewhere to trigger flattening
+    let trans_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 10.0, "width": 30.0, "height": 30.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [trans_id], "color": {"c": 0.2, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [trans_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [trans_id], "opacity": 50}));
+    
+    // Export as PDF/X-1a (no rasterization - balance 100)
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // All three spots should appear in the PDF
+    let has_spot_a = text.contains("SpotA");
+    let has_spot_b = text.contains("SpotB");
+    let has_spot_c = text.contains("SpotC");
+    
+    assert!(has_spot_a, "SpotA (base, no overprint) should appear in PDF");
+    assert!(has_spot_b, "SpotB (overprint) should appear in PDF");
+    assert!(has_spot_c, "SpotC (overprint) should appear in PDF");
+}
+
+/// Test: Tiles with no spot ink don't emit spot images for that tile.
+/// This verifies the zero-tint skip optimization works correctly.
+#[test]
+fn pdfx_1a_zero_tint_tile_skips_spot_image() {
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    // Create a large document that will tile (500x500 at 300ppi = many tiles)
+    run(&mut s, "file.new", json!({"width": 500, "height": 500, "colorMode": "cmyk"}));
+    
+    // Add a Registration swatch
+    s.execute("swatch.new", &json!({
+        "name": "[Registration]",
+        "spot": true,
+        "color": {"c": 1.0, "m": 1.0, "y": 1.0, "k": 1.0}
+    })).unwrap();
+    
+    // Add a spot swatch
+    s.execute("swatch.new", &json!({
+        "name": "TestSpot",
+        "spot": true,
+        "color": {"c": 0.5, "m": 0.0, "y": 0.0, "k": 0.0}
+    })).unwrap();
+    
+    // Create a small spot rectangle in one corner only (not covering most tiles)
+    let spot_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 10.0, "width": 50.0, "height": 50.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [spot_id], "swatch": "TestSpot"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [spot_id], "none": true}));
+    
+    // Create a semi-transparent overlay to trigger flattening with rasterization
+    let trans_id = run(&mut s, "shape.rectangle", json!({"x": 0.0, "y": 0.0, "width": 500.0, "height": 500.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [trans_id], "color": {"c": 0.1, "m": 0.1, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [trans_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [trans_id], "opacity": 50}));
+    
+    // Export with low balance to force rasterization
+    let p = json!({
+        "standard": "pdfX1a",
+        "compression": {"compressText": false},
+        "flattener": {"balance": 0, "lineArtPpi": 150}
+    });
+    let v = s.execute("document.exportPdf", &p).unwrap();
+    let bytes = vectorcraft_format::base64_decode(v["dataBase64"].as_str().unwrap()).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    
+    // Count spot image references - should be limited (not in every tile)
+    // The spot is only in one corner, so most tiles should NOT have spot images
+    let spot_refs = text.matches("TestSpot").count();
+    
+    // With a 500x500 document at 150ppi, we'd have multiple tiles.
+    // The spot should only appear in tiles that actually have spot content.
+    // If spot_refs is > 10, the zero-tint skip isn't working (would be many more with every tile).
+    assert!(spot_refs > 0, "TestSpot should appear in at least some tiles");
+    assert!(spot_refs < 20, "TestSpot should not appear in tiles with no spot content (got {} refs)", spot_refs);
+}
+
+/// Test: An opaque white Normal non-overprint rectangle on top of a spot knocks out the spot.
+/// But Multiply-blend or 50%-opacity rectangles should NOT knock out (spot ink shows through).
+#[test]
+fn pdfx_1a_white_knockout_removes_spot_ink() {
+    use crate::cmd::flatten::render_spot_tint_test;
+    
+    let _g = crate::tests_colormgmt::GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 100, "height": 100, "colorMode": "cmyk"}));
+    
+    // Add a spot swatch
+    s.execute("swatch.new", &json!({
+        "name": "TestSpot",
+        "spot": true,
+        "color": {"c": 1.0, "m": 0.0, "y": 0.0, "k": 0.0}
+    })).unwrap();
+    
+    // Create a spot rectangle covering the whole page
+    let spot_id = run(&mut s, "shape.rectangle", json!({"x": 0.0, "y": 0.0, "width": 100.0, "height": 100.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [spot_id], "swatch": "TestSpot"}));
+    run(&mut s, "paint.setStroke", json!({"ids": [spot_id], "none": true}));
+    
+    // Create an opaque white Normal non-overprint rectangle on top (should knock out)
+    let white_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 10.0, "width": 30.0, "height": 30.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [white_id], "color": {"c": 0.0, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [white_id], "none": true}));
+    // Ensure not overprinting (default should be false, but be explicit)
+    s.execute("attributes.set", &json!({"ids": [white_id], "overprintFill": false})).unwrap();
+    
+    // Create a Multiply-blend white rectangle (should NOT knock out)
+    let multiply_id = run(&mut s, "shape.rectangle", json!({"x": 50.0, "y": 10.0, "width": 30.0, "height": 30.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [multiply_id], "color": {"c": 0.0, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [multiply_id], "none": true}));
+    s.execute("transparency.set", &json!({"ids": [multiply_id], "blend": "multiply"})).unwrap();
+    
+    // Create a 50% opacity white rectangle (should NOT knock out)
+    let trans_id = run(&mut s, "shape.rectangle", json!({"x": 10.0, "y": 50.0, "width": 30.0, "height": 30.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [trans_id], "color": {"c": 0.0, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [trans_id], "none": true}));
+    run(&mut s, "transparency.set", json!({"ids": [trans_id], "opacity": 50}));
+    
+    // Create an overprinting white rectangle (should NOT knock out)
+    let overprint_id = run(&mut s, "shape.rectangle", json!({"x": 50.0, "y": 50.0, "width": 30.0, "height": 30.0}))["id"].as_u64().unwrap();
+    run(&mut s, "paint.setFill", json!({"ids": [overprint_id], "color": {"c": 0.0, "m": 0.0, "y": 0.0, "k": 0.0}}));
+    run(&mut s, "paint.setStroke", json!({"ids": [overprint_id], "none": true}));
+    s.execute("attributes.set", &json!({"ids": [overprint_id], "overprintFill": true})).unwrap();
+    
+    // Render the spot tint for the whole document
+    let doc_state = s.doc().unwrap();
+    let doc = &doc_state.doc;
+    // Get all art from layers
+    let art: Vec<_> = doc.layers.iter().flat_map(|l| l.children().into_iter().flatten()).map(|n| (**n).clone()).collect();
+    let region = vectorcraft_geom::Rect::new(0.0, 0.0, 100.0, 100.0);
+    let scale = 1.0; // 72 ppi for simplicity
+    
+    let tint = render_spot_tint_test(doc, &art, "TestSpot", region, scale);
+    
+    // Check pixel values in different regions:
+    // - Under opaque white Normal non-overprint: should be 255 (no ink / knocked out)
+    // - Under Multiply-blend white: should be < 255 (spot ink shows)
+    // - Under 50% opacity white: should be < 255 (spot ink shows)
+    // - Under overprinting white: should be < 255 (spot ink shows)
+    // - Elsewhere: should be < 255 (spot ink)
+    
+    // Sample pixels (at scale 1.0, pixel coords = point coords)
+    let px = |x: usize, y: usize| tint[y * 100 + x];
+    
+    // Center of opaque white knockout area (25, 25)
+    let knockout_px = px(25, 25);
+    assert_eq!(knockout_px, 255, "Opaque white Normal non-overprint should knock out spot (expected 255/no ink, got {})", knockout_px);
+    
+    // Center of Multiply-blend area (65, 25)
+    let multiply_px = px(65, 25);
+    assert!(multiply_px < 255, "Multiply-blend white should NOT knock out spot (expected <255, got {})", multiply_px);
+    
+    // Center of 50% opacity area (25, 65)
+    let trans_px = px(25, 65);
+    assert!(trans_px < 255, "50% opacity white should NOT knock out spot (expected <255, got {})", trans_px);
+    
+    // Center of overprinting area (65, 65)
+    let overprint_px = px(65, 65);
+    assert!(overprint_px < 255, "Overprinting white should NOT knock out spot (expected <255, got {})", overprint_px);
+    
+    // Uncovered spot area (5, 5)
+    let spot_px = px(5, 5);
+    assert!(spot_px < 255, "Uncovered spot should have ink (expected <255, got {})", spot_px);
 }

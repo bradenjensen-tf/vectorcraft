@@ -600,12 +600,15 @@ fn include_bleed_pdfx_rows_do_not_warn_about_the_bleed() {
     let mut s = session(1);
     s.execute("document.setup", &json!({"bleed": 6})).unwrap();
     let warned = |r: &Value| r["warnings"].as_array().unwrap().iter().any(|w| w == super::pdf::BLEED_LEFT_OUT);
-    let row = json!([{"format": "pdf", "standard": "pdfX4"}]);
-    assert!(warned(&export(&mut s, json!({"formats": row}))));
-    assert!(!warned(&export(&mut s, json!({"includeBleed": true, "formats": row}))));
+    // PDF/X now uses document bleed by default, so no warning unless useDocument is explicitly false.
+    let row_no_bleed = json!([{"format": "pdf", "standard": "pdfX4", "bleed": {"useDocument": false}}]);
+    let row_with_bleed = json!([{"format": "pdf", "standard": "pdfX4"}]);
+    assert!(warned(&export(&mut s, json!({"formats": row_no_bleed}))), "explicit useDocument: false warns");
+    assert!(!warned(&export(&mut s, json!({"formats": row_with_bleed}))), "default uses document bleed, no warning");
+    assert!(!warned(&export(&mut s, json!({"includeBleed": true, "formats": row_no_bleed}))), "includeBleed overrides");
     // A selection is written on a page of its own bounds, which Include Bleed doesn't grow.
     s.execute("shape.rectangle", &json!({"x": 5, "y": 5, "width": 10, "height": 10})).unwrap();
-    assert!(warned(&export(&mut s, json!({"includeBleed": true, "selection": "one", "formats": row}))));
+    assert!(warned(&export(&mut s, json!({"includeBleed": true, "selection": "one", "formats": row_no_bleed}))));
 }
 
 #[test]

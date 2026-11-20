@@ -19,8 +19,8 @@ pub(super) struct Fill {
     /// What it composites: its screen colour (twice), or in a CMYK document its two ink planes
     /// ([`cmyk_planes`]).
     pub(super) planes: [[f32; 3]; 2],
-    opacity: f32,
-    blend: BlendMode,
+    pub(super) opacity: f32,
+    pub(super) blend: BlendMode,
     pub(super) paint: Paint,
     pub(super) overprint: bool,
 }
@@ -191,6 +191,8 @@ pub(super) struct Composer<'a> {
     pub(super) sources: &'a [usize],
     /// The last solid fill composited.
     pub(super) top: Option<&'a Fill>,
+    /// All fills composited in order (for overprint stack preservation).
+    pub(super) fill_stack: Vec<&'a Fill>,
     /// Which of the fills' [`Fill::planes`] composites.
     pub(super) plane: usize,
 }
@@ -239,6 +241,7 @@ impl<'a> Composer<'a> {
         match &e.body {
             Body::Fills { shape, fills } if self.inside(*shape) => fills.iter().fold(b, |acc, f| {
                 self.top = Some(f);
+                self.fill_stack.push(f);
                 let [r, g, b] = f.planes[self.plane];
                 composite(f.blend, acc, [r, g, b, f.opacity])
             }),

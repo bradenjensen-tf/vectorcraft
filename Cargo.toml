@@ -117,6 +117,9 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 rustix = { version = "1.1", default-features = false }
 # Zstandard decoder (pure Rust, builds for wasm32 too): the editing copy an EPS carries of its art.
 ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
+# Zstandard encoder (C library bindings, BSD-3-Clause): better compression for the AI editing data.
+# Not available on wasm32 (falls back to ruzstd there).
+zstd = { version = "0.14", default-features = false }
 # vectorcraft-doc's CMYK TIFF reader and writer (src/cmyk.rs) still use `tiff`. `zune-jpeg` and
 # `hayro-ccitt` are only the references tests compare craft-image-codecs' CMYK JPEG inks and
 # craft-stream-codecs' Group 3 rows with (vectorcraft-doc's and vectorcraft-engine's dev-dependencies).

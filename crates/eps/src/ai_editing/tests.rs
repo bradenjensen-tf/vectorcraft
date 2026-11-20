@@ -1588,6 +1588,38 @@ fn a_restored_document_opens_on_the_artboard_the_copy_names() {
     assert_eq!(crate::ai_opened_artboard(b"%AI24_ZStandard_Data not zstd", &doc), None);
 }
 
+/// Document bleed (top, bottom, left, right) is written to the Document dictionary as
+/// BleedTopValue, BleedBottomValue, BleedLeftValue, BleedRightValue and reads back with
+/// the same values. When all sides are zero, no entries are written.
+#[test]
+fn document_bleed_round_trips() {
+    let mut doc = Document::new(200.0, 100.0);
+    // No bleed: no entry.
+    let p = program(&doc);
+    assert!(!p.contains("BleedTopValue"), "no bleed = no entry");
+    assert!(!p.contains("BleedBottomValue"), "no bleed = no entry");
+    assert!(!p.contains("BleedLeftValue"), "no bleed = no entry");
+    assert!(!p.contains("BleedRightValue"), "no bleed = no entry");
+    // Uniform bleed.
+    doc.setup.bleed = [9.0, 9.0, 9.0, 9.0];
+    let p = program(&doc);
+    assert!(p.contains("(BleedTopValue)"), "bleed written: {p}");
+    assert!(p.contains("(BleedBottomValue)"), "bleed written: {p}");
+    assert!(p.contains("(BleedLeftValue)"), "bleed written: {p}");
+    assert!(p.contains("(BleedRightValue)"), "bleed written: {p}");
+    let back = read_back(&doc);
+    assert_eq!(back.setup.bleed, [9.0, 9.0, 9.0, 9.0]);
+    // Uneven bleed: [top, bottom, left, right] in VectorCraft.
+    doc.setup.bleed = [4.0, 2.0, 3.0, 1.0];
+    let p = program(&doc);
+    assert!(p.contains("4 /Real (BleedTopValue)"), "{p}");
+    assert!(p.contains("2 /Real (BleedBottomValue)"), "{p}");
+    assert!(p.contains("3 /Real (BleedLeftValue)"), "{p}");
+    assert!(p.contains("1 /Real (BleedRightValue)"), "{p}");
+    let back = read_back(&doc);
+    assert_eq!(back.setup.bleed, [4.0, 2.0, 3.0, 1.0]);
+}
+
 /// A guide is its path followed by `(n) *` (closed) or `(N) *` (open), with no `(N) *` before
 /// it, and reads back as the same guide.
 #[test]
@@ -4591,6 +4623,61 @@ fn scaled_point_type_and_a_last_empty_paragraph_come_back() {
     );
 }
 
+/// Rotated area type comes back with its frame rotated, the type readable. The rotation is
+/// encoded in the frame's path coordinates, not as a separate matrix.
+#[test]
+fn rotated_area_type_comes_back() {
+    use vectorcraft_doc::{CharStyle, TextKind, TextObject};
+    let mut doc = Document::new(300.0, 200.0);
+    let layer = doc.layers[0].id;
+    let st = CharStyle { size: 12.0, ..style(12.0, Color::BLACK) };
+    let frame = vectorcraft_geom::shapes::rectangle(Rect::new(0.0, 0.0, 80.0, 40.0));
+    let mut rotated = TextObject::point(vectorcraft_geom::Point::ZERO, "Rotated area type", st.clone());
+    rotated.kind = TextKind::Area { frame: frame.clone() };
+    rotated.xf = Affine::translate((50.0, 50.0)) * Affine::rotate(std::f64::consts::FRAC_PI_4);
+    let rotated = text_node(&mut doc, rotated);
+    doc.insert(Some(layer), usize::MAX, rotated).unwrap();
+    let out = export_ai_editing(&doc, &opts()).unwrap();
+    assert!(out.warnings.is_empty(), "rotated area type should not warn: {:?}", out.warnings);
+    let prog = program(&doc);
+    assert!(prog.contains("%AI11_BeginTextDocument"), "rotated area type should be in text document");
+    let back = read_back(&doc);
+    let texts: Vec<&TextObject> =
+        back.layers[0].children().unwrap().iter().filter_map(|n| if let NodeKind::Text(t) = &n.kind { Some(t.as_ref()) } else { None }).collect();
+    assert_eq!(texts.len(), 1, "one text object came back");
+    assert!(matches!(texts[0].kind, TextKind::Area { .. }), "came back as area type");
+    assert!(texts[0].plain_text().starts_with("Rotated area type"), "text preserved: {:?}", texts[0].plain_text());
+    if let TextKind::Area { frame } = &texts[0].kind {
+        let bounds = frame.bounds().unwrap();
+        assert!(bounds.width() > 20.0 && bounds.height() > 20.0, "frame has extent: {bounds:?}");
+    }
+}
+
+/// Rotated type on a path comes back with its path rotated.
+#[test]
+fn rotated_type_on_path_comes_back() {
+    use vectorcraft_doc::{CharStyle, TextKind, TextObject};
+    let mut doc = Document::new(300.0, 200.0);
+    let layer = doc.layers[0].id;
+    let st = CharStyle { size: 12.0, ..style(12.0, Color::BLACK) };
+    let path = vectorcraft_geom::shapes::ellipse(Rect::new(0.0, 0.0, 100.0, 50.0));
+    let mut rotated = TextObject::point(vectorcraft_geom::Point::ZERO, "On path", st);
+    rotated.kind = TextKind::OnPath { path, start: 0.0, end: None };
+    rotated.xf = Affine::translate((150.0, 100.0)) * Affine::rotate(-0.3);
+    let rotated = text_node(&mut doc, rotated);
+    doc.insert(Some(layer), usize::MAX, rotated).unwrap();
+    let out = export_ai_editing(&doc, &opts()).unwrap();
+    assert!(out.warnings.is_empty(), "rotated type on path should not warn: {:?}", out.warnings);
+    let prog = program(&doc);
+    assert!(prog.contains("%AI11_BeginTextDocument"), "rotated type on path should be in text document");
+    let back = read_back(&doc);
+    let texts: Vec<&TextObject> =
+        back.layers[0].children().unwrap().iter().filter_map(|n| if let NodeKind::Text(t) = &n.kind { Some(t.as_ref()) } else { None }).collect();
+    assert_eq!(texts.len(), 1, "one text object came back");
+    assert!(matches!(texts[0].kind, TextKind::OnPath { .. }), "came back as type on path");
+    assert!(texts[0].plain_text().starts_with("On path"), "text preserved: {:?}", texts[0].plain_text());
+}
+
 /// A threaded story whose frames each hold their slice of it, a paragraph split between them,
 /// comes back as one story in its first frame with each paragraph's attributes once.
 #[test]
@@ -5098,14 +5185,16 @@ fn scaled_area_type_and_type_on_a_path_stay_type() {
     assert!(matches!(texts[1].kind, TextKind::OnPath { .. }));
     assert_eq!(r3(texts[1].runs[0].style.size * k(texts[1])), "100.000");
 
+    // Unevenly scaled area type now stays type (the frame's shape is preserved by the writer).
     let mut doc = Document::new(200.0, 100.0);
     let layer = doc.layers[0].id;
     let mut uneven = framed("Uneven", Rect::new(10.0, 10.0, 50.0, 30.0));
     uneven.xf = Affine::new([2.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
     let uneven = text_node(&mut doc, uneven);
     doc.insert(Some(layer), usize::MAX, uneven).unwrap();
-    assert!(!program(&doc).contains("/AI11Text"));
+    assert!(program(&doc).contains("/AI11Text"));
 
+    // Threaded frames at two different scales are written as outlines (threads need uniform scaling).
     let mut doc = Document::new(200.0, 100.0);
     let layer = doc.layers[0].id;
     let first = framed("A story in two frames", Rect::new(10.0, 10.0, 50.0, 30.0));
@@ -13003,4 +13092,29 @@ fn a_cut_clipping_object_without_room_for_its_mask_gets_no_carrier() {
             assert_eq!(carriers, [true], "{text}");
         }
     }
+}
+
+/// A document with ~20k paths at varying opacities compresses well: the Zstandard-compressed
+/// private data is no more than 25% of the uncompressed program size (level 9 gives ~8%).
+#[test]
+fn many_paths_compress_well() {
+    let mut doc = Document::new(1000.0, 1000.0);
+    let layer = doc.layers[0].id;
+    for i in 0..20_000 {
+        let x = (i % 100) as f64 * 10.0;
+        let y = (i / 100) as f64 * 5.0;
+        let opacity = ((i % 10) as f32 + 1.0) / 10.0;
+        let mut node = square(&mut doc, Rect::new(x, y, x + 8.0, y + 4.0), Color::gray(0.5));
+        node.opacity = opacity;
+        doc.insert(Some(layer), usize::MAX, node).unwrap();
+    }
+    let out = export_ai_editing(&doc, &opts()).unwrap();
+    let (p, _) = private_data(&doc, &opts()).unwrap();
+    // The compressed data should be much smaller than the uncompressed program.
+    // With zstd level 9, we get ~8% ratio; ruzstd Fastest gives ~40%.
+    // We allow up to 25% to give headroom for different platforms.
+    let compressed_len = p.data.len() - ZSTD_MARKER.len();
+    let uncompressed_len = out.program.len();
+    let ratio = compressed_len as f64 / uncompressed_len as f64;
+    assert!(ratio < 0.25, "compression ratio {:.1}% should be under 25% (compressed {compressed_len}, uncompressed {uncompressed_len})", ratio * 100.0);
 }

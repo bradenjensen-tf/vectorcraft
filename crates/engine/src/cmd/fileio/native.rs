@@ -280,7 +280,8 @@ pub(super) fn ai_options(cmd: &str, f: &Format, doc: &Document, p: &Value) -> Re
     let mut q = p.clone();
     if let Some(o) = q.as_object_mut() {
         // AI carries the current native format without a separate preview. Its compression
-        // and PDF-content flags are still validated as booleans. Its coordinates are written exactly.
+        // and PDF-content flags are still validated as booleans. Coordinates are rounded to 4
+        // decimal places for smaller files, like the PDF's embedded native copy.
         o.retain(|k, _| !matches!(k.as_str(), "version" | "preview" | "precision"));
         if o.get("pdfCompatible").is_some_and(Value::is_null) {
             o.remove("pdfCompatible");
@@ -289,6 +290,7 @@ pub(super) fn ai_options(cmd: &str, f: &Format, doc: &Document, p: &Value) -> Re
     let (mut so, _) = save_options(cmd, f, doc, &q)?;
     so.pretty = false;
     so.compress = false; // The PDF compresses its editing attachment.
+    so.precision = Some(4); // Smaller files; matches PDF's EDITING_PRECISION.
     Ok(so)
 }
 

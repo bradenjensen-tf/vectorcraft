@@ -237,3 +237,84 @@ fn a_file_name_written_as_utf16_is_found() {
         assert_eq!(e.data, b"hello", "/{key}");
     }
 }
+
+/// A document with `n` random paths for size measurement.
+fn synthetic(n: usize) -> Document {
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % 1_000_000) as f64 / 1_000_000.0
+        }
+    }
+    let mut d = Document::new(1600.0, 1200.0);
+    let layer = d.default_layer();
+    let mut r = Rng(42);
+    for i in 0..n {
+        let (x, y, s) = (r.next() * 1600.0, r.next() * 1200.0, 3.0 + r.next() * 22.0);
+        let c = Color::rgb(r.next() as f32, r.next() as f32, r.next() as f32);
+        let id = d.alloc_id();
+        let node = match i % 3 {
+            0 => Node::path(id, shapes::ellipse(Rect::from_center_size(vectorcraft_geom::Point::new(x, y), (2.0 * s, 2.0 * s))), Appearance::basic(Paint::solid(c), Paint::solid(Color::BLACK), 0.5)),
+            1 => Node::path(id, shapes::rectangle(Rect::new(x, y, x + 2.0 * s, y + s)), Appearance::basic(Paint::solid(c), Paint::None, 0.0)),
+            _ => Node::path(id, shapes::star(vectorcraft_geom::Point::new(x, y), s, s / 2.0, 5, 0.0), Appearance::basic(Paint::None, Paint::solid(c), 2.0)),
+        };
+        d.insert(layer, usize::MAX, node).unwrap();
+    }
+    d
+}
+
+#[test]
+fn zstd_compressed_editing_data_round_trips() {
+    let native = b"{\"format\":\"vectorcraft\",\"version\":4,\"document\":{}}";
+    let r = pdf_with(Some(native), true);
+    let e = editing(&r.bytes).unwrap();
+    assert_eq!(e.data.as_slice(), native.as_slice());
+    assert!(e.intact);
+}
+
+/// (Uncomment to measure size impact manually.)
+#[test]
+#[ignore]
+fn measure_editing_data_size() {
+    use std::io::Read;
+
+    let d = synthetic(20_000);
+    let native_full = vectorcraft_format::save_with(&d, &vectorcraft_format::SaveOptions::default()).unwrap();
+    let native_rounded = vectorcraft_format::save_with(&d, &vectorcraft_format::SaveOptions { precision: Some(4), ..Default::default() }).unwrap();
+    eprintln!("Native JSON: full {} bytes, 4-decimal {} bytes ({:.1}% smaller)",
+        native_full.len(), native_rounded.len(), 100.0 * (1.0 - native_rounded.len() as f64 / native_full.len() as f64));
+
+    // Zstd compression (level 9 on native).
+    fn zstd_compress(data: &[u8]) -> Vec<u8> {
+        zstd::encode_all(std::io::Cursor::new(data), 9).unwrap()
+    }
+    let zstd_full = zstd_compress(&native_full);
+    let zstd_rounded = zstd_compress(&native_rounded);
+    eprintln!("Zstd compressed: full {} bytes, 4-decimal {} bytes ({:.1}% smaller)",
+        zstd_full.len(), zstd_rounded.len(), 100.0 * (1.0 - zstd_rounded.len() as f64 / zstd_full.len() as f64));
+
+    // Compare to what it was before (Flate-only, no zstd).
+    fn flate_compress(data: &[u8]) -> Vec<u8> {
+        use flate2::write::DeflateEncoder;
+        let mut e = DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        std::io::Write::write_all(&mut e, data).unwrap();
+        e.finish().unwrap()
+    }
+    let flate_full = flate_compress(&native_full);
+    let flate_rounded = flate_compress(&native_rounded);
+    eprintln!("Flate compressed: full {} bytes, 4-decimal {} bytes",
+        flate_full.len(), flate_rounded.len());
+    eprintln!("Zstd vs Flate (rounded): {:.1}% smaller",
+        100.0 * (1.0 - zstd_rounded.len() as f64 / flate_rounded.len() as f64));
+
+    // Verify round-trip.
+    let mut out = vec![];
+    ruzstd::decoding::StreamingDecoder::new(&mut &zstd_rounded[..])
+        .unwrap()
+        .read_to_end(&mut out)
+        .unwrap();
+    assert_eq!(out, native_rounded);
+}

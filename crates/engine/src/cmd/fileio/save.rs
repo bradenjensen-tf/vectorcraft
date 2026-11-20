@@ -786,8 +786,8 @@ pub(super) fn encode_ai(cmd: &str, f: &Format, doc: &Document, p: &Value) -> Res
 }
 
 /// `p` with the PDF options a `.ai` file is written with: Preserve Editing when `editing` is true,
-/// layers unless a standard decides, long pages with a `UserUnit`, and `compress` as
-/// `compression.compressText`.
+/// layers unless a standard decides, long pages with a `UserUnit`, document bleed for the boxes,
+/// and `compress` as `compression.compressText`.
 fn ai_pdf_params(p: &Value, editing: bool) -> Value {
     let mut params = if p.is_object() { p.clone() } else { json!({}) };
     if let Some(o) = params.as_object_mut() {
@@ -799,6 +799,11 @@ fn ai_pdf_params(p: &Value, editing: bool) -> Value {
         // A page longer than 14,400 pt keeps its `UserUnit` (PDF export writes it in points).
         if o.get("longPagesInPoints").is_none_or(Value::is_null) {
             o.insert("longPagesInPoints".into(), json!(false));
+        }
+        // Use the document's bleed for the PDF boxes: MediaBox = BleedBox = artboard + bleed,
+        // TrimBox = artboard. This matches Illustrator's convention.
+        if o.get("bleed").is_none_or(Value::is_null) {
+            o.insert("bleed".into(), json!({"useDocument": true}));
         }
         if let Some(c) = o.get("compress").and_then(Value::as_bool) {
             let compression = o.entry("compression").or_insert_with(|| json!({}));

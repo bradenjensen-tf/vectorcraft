@@ -839,7 +839,8 @@ impl<'a> Reader<'a> {
 
     /// The `/Document` dictionary: the artboards and their display options, the active artboard
     /// (`CropAreaActive`, `/Int`: its index in the `ArtboardArray`, next to it), Document Raster
-    /// Effects Settings, its variable library (the first one read), and its Objects on Path records.
+    /// Effects Settings, document bleed (from `AIDocumentBleed`), its variable library (the first
+    /// one read), and its Objects on Path records.
     pub(super) fn document(&mut self, o: &Obj) {
         if !self.variables.present {
             self.variables = variable_library(o, &mut self.names);
@@ -849,6 +850,25 @@ impl<'a> Reader<'a> {
             raster_settings(r, &mut self.doc);
         }
         let Some(holder) = find_holder(o, "ArtboardArray", 0) else { return };
+        // Document bleed: Illustrator stores four separate /Real entries in the Document dictionary:
+        // BleedTopValue, BleedLeftValue, BleedBottomValue, BleedRightValue.
+        // These are in the same holder as ArtboardArray and CropAreaActive.
+        // Fall back to AIDocumentBleed array for older files or compatibility.
+        let bleed_top = typed(holder, "BleedTopValue", "Real");
+        let bleed_bottom = typed(holder, "BleedBottomValue", "Real");
+        let bleed_left = typed(holder, "BleedLeftValue", "Real");
+        let bleed_right = typed(holder, "BleedRightValue", "Real");
+        if bleed_top.is_some() || bleed_bottom.is_some() || bleed_left.is_some() || bleed_right.is_some() {
+            // VectorCraft bleed order: [top, bottom, left, right]
+            self.doc.setup.bleed = [bleed_top.unwrap_or(0.0), bleed_bottom.unwrap_or(0.0), bleed_left.unwrap_or(0.0), bleed_right.unwrap_or(0.0)];
+        } else if let Some(array) = holder.obj("AIDocumentBleed") {
+            // Fallback: AIDocumentBleed array [top, left, bottom, right] for older files.
+            let bleed_vals: Vec<f64> = array.entries.iter().flat_map(|(_, vals)| vals.iter().filter_map(|v| v.num())).collect();
+            if let [top, left, bottom, right, ..] = bleed_vals.as_slice() {
+                // Map to VectorCraft's [top, bottom, left, right] order.
+                self.doc.setup.bleed = [*top, *bottom, *left, *right];
+            }
+        }
         let Some(list) = holder.obj("ArtboardArray") else { return };
         let active = typed(holder, "CropAreaActive", "Int");
         for (i, ab) in list.items().enumerate().take(1000) {

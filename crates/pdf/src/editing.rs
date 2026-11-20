@@ -1,6 +1,9 @@
 //! Preserve Editing: the native document travels inside the PDF as an embedded file, with a hash
 //! of the pages it was written with, so a PDF whose pages another app changed is noticed (and
 //! opens as its artwork instead of the stale native document).
+//!
+//! The native document is zstd-compressed before PDF embedding (level 9 on native, fastest on
+//! wasm). The reader decompresses zstd or returns the data as-is for older Flate-only files.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -40,14 +43,48 @@ pub struct Editing {
     pub intact: bool,
 }
 
+/// Zstd magic bytes: 0x28 0xB5 0x2F 0xFD.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Compress `data` with zstd (level 9 on native, fastest on wasm).
+fn zstd_compress(data: &[u8]) -> Vec<u8> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        zstd::encode_all(std::io::Cursor::new(data), 9).unwrap_or_else(|_| {
+            ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
+        })
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
+    }
+}
+
+/// Decompress `data` if it's zstd-compressed, otherwise return as-is (for older Flate-only files).
+fn zstd_decompress(data: Vec<u8>) -> Vec<u8> {
+    if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
+        let mut out = vec![];
+        if let Ok(decoder) = ruzstd::decoding::StreamingDecoder::new(&mut &data[..]) {
+            if std::io::Read::read_to_end(&mut { decoder }, &mut out).is_ok() {
+                return out;
+            }
+        }
+        data
+    } else {
+        data
+    }
+}
+
 /// The embedded file for `native`, its description holding the hash placeholder [`seal`] fills.
+/// The native bytes are zstd-compressed for a smaller PDF.
 pub(crate) fn embedded_file(native: &[u8], compress: bool, date: Option<DateTime>) -> EmbeddedFile {
+    let compressed = zstd_compress(native);
     EmbeddedFile {
         path: EDITING_FILE.into(),
         mime_type: MimeType::new("application/json"),
         description: Some(format!("{DESCRIPTION}{PLACEHOLDER}")),
         association_kind: AssociationKind::Source,
-        data: native.to_vec().into(),
+        data: compressed.into(),
         modification_date: date,
         compress: Some(compress),
         location: None,
@@ -86,6 +123,8 @@ pub(crate) fn editing_in(pdf: &Pdf) -> Option<Editing> {
     let files = spec.get::<Dict<'_>>(b"EF")?;
     let stream = files.get::<Stream<'_>>(b"F").or_else(|| files.get::<Stream<'_>>(b"UF"))?;
     let data = stream.decoded().map(|d| d.into_owned()).unwrap_or_default();
+    // Decompress zstd if present (new files), or return as-is (older Flate-only files).
+    let data = zstd_decompress(data);
     // The hash ends the description (a text string, in any of its encodings); editing data
     // described otherwise is trusted.
     let desc = spec.get::<PdfString<'_>>(b"Desc").map(|d| text_string(d.as_bytes())).unwrap_or_default();

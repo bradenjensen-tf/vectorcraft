@@ -34,10 +34,11 @@ fn the_document_bleed_or_custom_values_grow_each_page() {
     let (media, bleed, trim) = boxes(&bytes);
     assert_eq!((media.width(), media.height()), (118.0, 98.0), "MediaBox = artboard + the document's 9 pt bleed");
     assert_eq!((bleed, trim), (media, kurbo::Rect::new(9.0, 9.0, 109.0, 89.0)));
-    // Press Quality uses the document's bleed; the default preset and custom values don't.
+    // Press Quality and the default now both use the document's bleed; explicit values override.
     assert_eq!(boxes(&export(&mut s, json!({"preset": "Press Quality"})).0).0.width(), 118.0);
-    assert_eq!(boxes(&export(&mut s, json!({})).0).0.width(), 100.0);
-    assert_eq!(boxes(&export(&mut s, json!({"bleed": {"left": 4.5}})).0).0.width(), 104.5);
+    assert_eq!(boxes(&export(&mut s, json!({})).0).0.width(), 118.0, "default uses document bleed");
+    assert_eq!(boxes(&export(&mut s, json!({"bleed": {"left": 4.5}})).0).0.width(), 104.5, "explicit values override");
+    assert_eq!(boxes(&export(&mut s, json!({"bleed": {"useDocument": false}})).0).0.width(), 100.0, "explicit useDocument: false disables");
 }
 
 #[test]

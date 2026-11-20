@@ -540,13 +540,33 @@ fn with_baked_masks(n: &Arc<Node>, done: &HashSet<vectorcraft_doc::NodeId>, bake
     Some(Arc::new(m))
 }
 
+/// Compress `data` with Zstandard at a good compression level.
+/// Native builds use the C library (level 9 for a good balance of speed and compression).
+/// WASM builds fall back to ruzstd's fastest level (the only one it implements).
+fn zstd_compress(data: &[u8]) -> Vec<u8> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Level 9 provides good compression without being too slow.
+        // Higher levels (up to 22) compress better but take significantly longer.
+        zstd::encode_all(std::io::Cursor::new(data), 9).unwrap_or_else(|_| {
+            // Fall back to ruzstd on error (shouldn't happen, but be safe).
+            ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
+        })
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        // ruzstd 0.9.1 only implements CompressionLevel::Fastest (level 1).
+        ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
+    }
+}
+
 /// The editing data of `doc` as a `.ai` file's pages carry it: the program compressed with
 /// Zstandard after `%AI24_ZStandard_Data`, its header as the `AIMetaData`, and the version numbers
 /// that go with that form; and what it couldn't hold.
 pub fn private_data(doc: &Document, o: &AiEditingOptions) -> Result<(PrivateData, Vec<String>), String> {
     let out = export_ai_editing(doc, o)?;
     let mut data = ZSTD_MARKER.to_vec();
-    data.extend(ruzstd::encoding::compress_to_vec(out.program.as_slice(), ruzstd::encoding::CompressionLevel::Fastest));
+    data.extend(zstd_compress(out.program.as_slice()));
     let p = PrivateData {
         data,
         metadata: out.header,
@@ -704,6 +724,17 @@ fn artboards(s: &mut String, doc: &Document, to_art: Affine, origin: (f64, f64),
     s.push_str("%_; (ArtboardArray) ,\n");
     let _ = writeln!(s, "%_{active} /Int (CropAreaActive) ,");
     let _ = writeln!(s, "%_{CANVAS_SIZE} /Int (AIDocumentCanvasSize) ,");
+    // Document bleed (top, bottom, left, right) in points, written to the Document dictionary.
+    // Illustrator stores this as four separate /Real entries: BleedTopValue, BleedLeftValue,
+    // BleedBottomValue, BleedRightValue, with the same syntax as other entries.
+    let bleed = doc.setup.bleed;
+    if bleed.iter().any(|b| *b > 0.0) {
+        // VectorCraft bleed order: [top, bottom, left, right]
+        let _ = writeln!(s, "%_{} /Real (BleedTopValue) ,", ps::num(bleed[0]));
+        let _ = writeln!(s, "%_{} /Real (BleedBottomValue) ,", ps::num(bleed[1]));
+        let _ = writeln!(s, "%_{} /Real (BleedLeftValue) ,", ps::num(bleed[2]));
+        let _ = writeln!(s, "%_{} /Real (BleedRightValue) ,", ps::num(bleed[3]));
+    }
     // The variable library, after the canvas size.
     s.push_str(library);
     s.push_str("%_; /Recorded ,\n%_/Dictionary : /NotRecorded ,\n%_; /NotRecorded ,\n%_;\n%AI9_EndDocumentData\n");

@@ -282,9 +282,10 @@ fn thumbnail_of(preview: &Rendered, rect: Rect) -> Result<Raster> {
 /// What the file carries to reopen: `doc` (with only artboard `board` when the file is one of
 /// several artboards), with linked images whole when `include_linked`.
 fn native(doc: &Document, board: Option<usize>, include_linked: bool) -> Vec<u8> {
+    let opts = vectorcraft_format::SaveOptions { precision: Some(4), ..Default::default() };
     let several = board.filter(|_| doc.artboards.len() > 1);
     if several.is_none() && !include_linked {
-        return vectorcraft_format::save(doc, false);
+        return vectorcraft_format::save_with(doc, &opts).unwrap_or_default();
     }
     let mut d = doc.clone();
     if let Some(a) = several.and_then(|b| doc.artboards.get(b)) {
@@ -296,7 +297,7 @@ fn native(doc: &Document, board: Option<usize>, include_linked: bool) -> Vec<u8>
             blob.proxy = None;
         }
     }
-    vectorcraft_format::save(&d, false)
+    vectorcraft_format::save_with(&d, &opts).unwrap_or_default()
 }
 
 /// Encode `doc` as EPS: one file of the visible art, or with Use Artboards one per chosen
